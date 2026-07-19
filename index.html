@@ -1,0 +1,1812 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="CulChar — Websites and mobile applications, built for your culture. We craft software that adapts to your business ethos using modern development techniques.">
+    <meta name="keywords" content="web development, mobile app development, software company, culture-driven development, CulChar">
+    <meta name="author" content="CulChar">
+
+    <!-- Open Graph / Social Sharing -->
+    <meta property="og:type" content="website">
+    <meta property="og:title" content="CulChar — The Code We Live By">
+    <meta property="og:description" content="Websites and mobile applications, built for your culture.">
+    <meta property="og:url" content="https://culchar.com">
+    <meta property="og:image" content="https://culchar.com/og-image.jpg">
+
+    <!-- Twitter Card -->
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="CulChar — The Code We Live By">
+    <meta name="twitter:description" content="Websites and mobile applications, built for your culture.">
+
+    <!-- Favicon placeholder -->
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='4' fill='%231a1a1a'/><circle cx='16' cy='16' r='4' fill='%23c4463a'/></svg>">
+
+    <title>CulChar — The Code We Live By</title>
+
+    <!-- Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Cormorant+Garamond:ital,wght@0,400;0,600;1,400&family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
+
+    <style>
+        /* ============================================
+           CSS CUSTOM PROPERTIES
+           ============================================ */
+        :root {
+            --bg-primary: #1a1a1a;
+            --bg-secondary: #111111;
+            --bg-elevated: #242424;
+            --bg-card: #1e1e1e;
+            --text-primary: #f0ebe3;
+            --text-secondary: #a39e96;
+            --text-muted: #6b6560;
+            --accent: #c4463a;
+            --accent-hover: #d95a4e;
+            --accent-dim: rgba(196, 70, 58, 0.15);
+            --border: rgba(240, 235, 227, 0.08);
+            --border-hover: rgba(240, 235, 227, 0.15);
+            --font-display: 'Bebas Neue', sans-serif;
+            --font-serif: 'Cormorant Garamond', serif;
+            --font-body: 'DM Sans', sans-serif;
+            --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+            --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+        }
+
+        /* ============================================
+           RESET & BASE
+           ============================================ */
+        *, *::before, *::after {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        html {
+            scroll-behavior: smooth;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+
+        body {
+            font-family: var(--font-body);
+            font-weight: 300;
+            background-color: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.7;
+            overflow-x: hidden;
+            font-size: 16px;
+        }
+
+        ::selection {
+            background: var(--accent);
+            color: var(--text-primary);
+        }
+
+        img {
+            max-width: 100%;
+            display: block;
+        }
+
+        a {
+            color: inherit;
+            text-decoration: none;
+        }
+
+        /* ============================================
+           SCROLLBAR
+           ============================================ */
+        ::-webkit-scrollbar {
+            width: 6px;
+        }
+        ::-webkit-scrollbar-track {
+            background: var(--bg-secondary);
+        }
+        ::-webkit-scrollbar-thumb {
+            background: var(--text-muted);
+            border-radius: 3px;
+        }
+
+        /* ============================================
+           UTILITY
+           ============================================ */
+        .container {
+            max-width: 1280px;
+            margin: 0 auto;
+            padding: 0 clamp(1.5rem, 5vw, 4rem);
+        }
+
+        .section-label {
+            font-family: var(--font-body);
+            font-weight: 500;
+            font-size: 0.7rem;
+            letter-spacing: 0.25em;
+            text-transform: uppercase;
+            color: var(--accent);
+            display: inline-flex;
+            align-items: center;
+            gap: 0.75rem;
+            margin-bottom: 2rem;
+        }
+
+        .section-label::before {
+            content: '';
+            width: 32px;
+            height: 1px;
+            background: var(--accent);
+        }
+
+        .reveal {
+            opacity: 0;
+            transform: translateY(40px);
+            transition: opacity 0.8s var(--ease-out), transform 0.8s var(--ease-out);
+        }
+
+        .reveal.visible {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        .reveal-delay-1 { transition-delay: 0.1s; }
+        .reveal-delay-2 { transition-delay: 0.2s; }
+        .reveal-delay-3 { transition-delay: 0.3s; }
+        .reveal-delay-4 { transition-delay: 0.4s; }
+
+        /* ============================================
+           NOISE OVERLAY
+           ============================================ */
+        body::after {
+            content: '';
+            position: fixed;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            pointer-events: none;
+            z-index: 9999;
+            opacity: 0.025;
+            background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E");
+            background-repeat: repeat;
+            background-size: 256px 256px;
+        }
+
+        /* ============================================
+           NAVIGATION
+           ============================================ */
+        .nav {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            z-index: 1000;
+            padding: 1.25rem 0;
+            transition: background 0.4s ease, padding 0.4s ease, backdrop-filter 0.4s ease;
+        }
+
+        .nav.scrolled {
+            background: rgba(17, 17, 17, 0.85);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            padding: 0.75rem 0;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .nav-inner {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .nav-logo {
+            display: flex;
+            align-items: center;
+            gap: 0.1em;
+            font-family: var(--font-display);
+            font-size: 1.6rem;
+            letter-spacing: 0.05em;
+            color: var(--text-primary);
+        }
+
+        .nav-logo .dot {
+            color: var(--accent);
+            font-size: 1.8rem;
+            line-height: 1;
+            margin: 0 -0.02em;
+        }
+
+        .nav-links {
+            display: flex;
+            align-items: center;
+            gap: 2.5rem;
+            list-style: none;
+        }
+
+        .nav-links a {
+            font-size: 0.8rem;
+            font-weight: 400;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: var(--text-secondary);
+            transition: color 0.3s ease;
+            position: relative;
+        }
+
+        .nav-links a::after {
+            content: '';
+            position: absolute;
+            bottom: -4px;
+            left: 0;
+            width: 0;
+            height: 1px;
+            background: var(--accent);
+            transition: width 0.3s var(--ease-out);
+        }
+
+        .nav-links a:hover {
+            color: var(--text-primary);
+        }
+
+        .nav-links a:hover::after {
+            width: 100%;
+        }
+
+        .nav-cta {
+            font-size: 0.75rem !important;
+            letter-spacing: 0.1em !important;
+            padding: 0.6rem 1.5rem;
+            border: 1px solid var(--accent);
+            color: var(--accent) !important;
+            transition: all 0.3s ease !important;
+        }
+
+        .nav-cta:hover {
+            background: var(--accent) !important;
+            color: var(--text-primary) !important;
+        }
+
+        .nav-cta::after {
+            display: none !important;
+        }
+
+        /* Mobile menu */
+        .nav-toggle {
+            display: none;
+            flex-direction: column;
+            gap: 5px;
+            cursor: pointer;
+            background: none;
+            border: none;
+            padding: 4px;
+        }
+
+        .nav-toggle span {
+            width: 24px;
+            height: 1.5px;
+            background: var(--text-primary);
+            transition: all 0.3s ease;
+            display: block;
+        }
+
+        .nav-toggle.active span:nth-child(1) {
+            transform: rotate(45deg) translate(4px, 5px);
+        }
+        .nav-toggle.active span:nth-child(2) {
+            opacity: 0;
+        }
+        .nav-toggle.active span:nth-child(3) {
+            transform: rotate(-45deg) translate(4px, -5px);
+        }
+
+        /* ============================================
+           HERO
+           ============================================ */
+        .hero {
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            position: relative;
+            overflow: hidden;
+            padding: 8rem 0 4rem;
+        }
+
+        .hero-bg-grid {
+            position: absolute;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            opacity: 0.03;
+            background-image:
+                linear-gradient(var(--text-primary) 1px, transparent 1px),
+                linear-gradient(90deg, var(--text-primary) 1px, transparent 1px);
+            background-size: 60px 60px;
+            pointer-events: none;
+        }
+
+        .hero-glow {
+            position: absolute;
+            width: 600px;
+            height: 600px;
+            border-radius: 50%;
+            background: radial-gradient(circle, var(--accent-dim) 0%, transparent 70%);
+            top: 20%;
+            right: -10%;
+            pointer-events: none;
+            animation: float 12s ease-in-out infinite;
+        }
+
+        @keyframes float {
+            0%, 100% { transform: translate(0, 0); }
+            50% { transform: translate(-30px, 20px); }
+        }
+
+        .hero-content {
+            position: relative;
+            z-index: 2;
+        }
+
+        .hero-eyebrow {
+            font-family: var(--font-body);
+            font-weight: 400;
+            font-size: 0.8rem;
+            letter-spacing: 0.2em;
+            text-transform: uppercase;
+            color: var(--text-muted);
+            margin-bottom: 2rem;
+            opacity: 0;
+            animation: fadeUp 1s var(--ease-out) 0.3s forwards;
+        }
+
+        .hero-title {
+            font-family: var(--font-display);
+            font-size: clamp(4rem, 12vw, 10rem);
+            line-height: 0.9;
+            letter-spacing: 0.02em;
+            color: var(--text-primary);
+            margin-bottom: 0.2em;
+            opacity: 0;
+            animation: fadeUp 1s var(--ease-out) 0.5s forwards;
+        }
+
+        .hero-title .dot {
+            color: var(--accent);
+            display: inline-block;
+        }
+
+        .hero-tagline {
+            font-family: var(--font-serif);
+            font-size: clamp(1.1rem, 2.5vw, 1.6rem);
+            font-weight: 400;
+            font-style: italic;
+            color: var(--text-secondary);
+            max-width: 600px;
+            margin-bottom: 1rem;
+            opacity: 0;
+            animation: fadeUp 1s var(--ease-out) 0.7s forwards;
+        }
+
+        .hero-description {
+            font-size: 1rem;
+            color: var(--text-muted);
+            max-width: 480px;
+            margin-bottom: 3rem;
+            opacity: 0;
+            animation: fadeUp 1s var(--ease-out) 0.9s forwards;
+        }
+
+        .hero-cta {
+            display: inline-flex;
+            align-items: center;
+            gap: 1rem;
+            font-family: var(--font-body);
+            font-weight: 500;
+            font-size: 0.85rem;
+            letter-spacing: 0.15em;
+            text-transform: uppercase;
+            color: var(--bg-primary);
+            background: var(--accent);
+            padding: 1rem 2.5rem;
+            border: none;
+            cursor: pointer;
+            position: relative;
+            overflow: hidden;
+            transition: all 0.4s var(--ease-out);
+            opacity: 0;
+            animation: fadeUp 1s var(--ease-out) 1.1s forwards;
+        }
+
+        .hero-cta:hover {
+            background: var(--accent-hover);
+            transform: translateY(-2px);
+            box-shadow: 0 10px 40px rgba(196, 70, 58, 0.3);
+        }
+
+        .hero-cta svg {
+            width: 16px;
+            height: 16px;
+            transition: transform 0.3s ease;
+        }
+
+        .hero-cta:hover svg {
+            transform: translateX(4px);
+        }
+
+        .hero-scroll-hint {
+            position: absolute;
+            bottom: 3rem;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 0.5rem;
+            opacity: 0;
+            animation: fadeIn 1s ease 2s forwards;
+        }
+
+        .hero-scroll-hint span {
+            font-size: 0.65rem;
+            letter-spacing: 0.2em;
+            text-transform: uppercase;
+            color: var(--text-muted);
+        }
+
+        .scroll-line {
+            width: 1px;
+            height: 40px;
+            background: linear-gradient(to bottom, var(--accent), transparent);
+            animation: scrollPulse 2s ease-in-out infinite;
+        }
+
+        @keyframes scrollPulse {
+            0%, 100% { opacity: 0.3; transform: scaleY(0.5); }
+            50% { opacity: 1; transform: scaleY(1); }
+        }
+
+        @keyframes fadeUp {
+            from { opacity: 0; transform: translateY(30px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+
+        /* Code decoration in hero */
+        .hero-code-deco {
+            position: absolute;
+            right: clamp(2rem, 8vw, 8rem);
+            top: 50%;
+            transform: translateY(-50%);
+            font-family: 'Courier New', monospace;
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            opacity: 0.15;
+            line-height: 2;
+            pointer-events: none;
+            white-space: pre;
+            text-align: right;
+        }
+
+        /* ============================================
+           ABOUT / NAME STORY
+           ============================================ */
+        .about {
+            padding: 10rem 0;
+            position: relative;
+        }
+
+        .about-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 6rem;
+            align-items: center;
+        }
+
+        .about-visual {
+            position: relative;
+        }
+
+        .about-word-art {
+            font-family: var(--font-display);
+            font-size: clamp(5rem, 10vw, 8rem);
+            line-height: 0.85;
+            letter-spacing: 0.02em;
+            color: var(--text-primary);
+            opacity: 0.06;
+            position: relative;
+        }
+
+        .about-pronunciation {
+            font-family: var(--font-serif);
+            font-style: italic;
+            font-size: 1.4rem;
+            color: var(--accent);
+            margin-top: 1.5rem;
+        }
+
+        .about-meaning-cards {
+            display: flex;
+            flex-direction: column;
+            gap: 1.5rem;
+            margin-top: 3rem;
+        }
+
+        .meaning-card {
+            padding: 1.5rem 2rem;
+            border-left: 2px solid var(--accent);
+            background: linear-gradient(135deg, var(--accent-dim) 0%, transparent 60%);
+        }
+
+        .meaning-card h4 {
+            font-family: var(--font-display);
+            font-size: 1.4rem;
+            letter-spacing: 0.08em;
+            margin-bottom: 0.5rem;
+        }
+
+        .meaning-card p {
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+            line-height: 1.6;
+        }
+
+        .about-text h2 {
+            font-family: var(--font-display);
+            font-size: clamp(2.2rem, 4vw, 3.2rem);
+            letter-spacing: 0.04em;
+            line-height: 1.1;
+            margin-bottom: 2rem;
+        }
+
+        .about-text h2 .accent {
+            color: var(--accent);
+        }
+
+        .about-text p {
+            font-size: 1rem;
+            color: var(--text-secondary);
+            margin-bottom: 1.5rem;
+            max-width: 520px;
+        }
+
+        .about-divider {
+            width: 60px;
+            height: 2px;
+            background: var(--accent);
+            margin: 2rem 0;
+        }
+
+        /* ============================================
+           SERVICES
+           ============================================ */
+        .services {
+            padding: 8rem 0 10rem;
+            background: var(--bg-secondary);
+            position: relative;
+        }
+
+        .services::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0;
+            width: 100%; height: 1px;
+            background: linear-gradient(to right, transparent, var(--border-hover), transparent);
+        }
+
+        .services-header {
+            text-align: center;
+            margin-bottom: 5rem;
+        }
+
+        .services-header h2 {
+            font-family: var(--font-display);
+            font-size: clamp(2.5rem, 5vw, 4rem);
+            letter-spacing: 0.04em;
+            line-height: 1;
+        }
+
+        .services-header p {
+            font-family: var(--font-serif);
+            font-style: italic;
+            font-size: 1.15rem;
+            color: var(--text-secondary);
+            margin-top: 1rem;
+            max-width: 500px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+
+        .services-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 2rem;
+        }
+
+        .service-card {
+            padding: clamp(2rem, 4vw, 3.5rem);
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            position: relative;
+            overflow: hidden;
+            transition: all 0.5s var(--ease-out);
+            cursor: default;
+        }
+
+        .service-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 3px;
+            background: var(--accent);
+            transform: scaleX(0);
+            transform-origin: left;
+            transition: transform 0.5s var(--ease-out);
+        }
+
+        .service-card:hover {
+            border-color: var(--border-hover);
+            transform: translateY(-4px);
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+        }
+
+        .service-card:hover::before {
+            transform: scaleX(1);
+        }
+
+        .service-icon {
+            width: 56px;
+            height: 56px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border: 1px solid var(--border-hover);
+            margin-bottom: 2rem;
+            color: var(--accent);
+            transition: all 0.4s ease;
+        }
+
+        .service-card:hover .service-icon {
+            background: var(--accent-dim);
+            border-color: var(--accent);
+        }
+
+        .service-icon svg {
+            width: 24px;
+            height: 24px;
+        }
+
+        .service-card h3 {
+            font-family: var(--font-display);
+            font-size: 1.8rem;
+            letter-spacing: 0.06em;
+            margin-bottom: 1rem;
+        }
+
+        .service-card p {
+            font-size: 0.95rem;
+            color: var(--text-secondary);
+            line-height: 1.7;
+        }
+
+        .service-tags {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            margin-top: 1.5rem;
+        }
+
+        .service-tags span {
+            font-size: 0.7rem;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            padding: 0.35rem 0.75rem;
+            border: 1px solid var(--border);
+            color: var(--text-muted);
+            transition: all 0.3s ease;
+        }
+
+        .service-card:hover .service-tags span {
+            border-color: var(--border-hover);
+            color: var(--text-secondary);
+        }
+
+        /* ============================================
+           PHILOSOPHY / APPROACH
+           ============================================ */
+        .philosophy {
+            padding: 10rem 0;
+            position: relative;
+        }
+
+        .philosophy-layout {
+            display: grid;
+            grid-template-columns: 1fr 1.2fr;
+            gap: 6rem;
+            align-items: start;
+        }
+
+        .philosophy-left h2 {
+            font-family: var(--font-display);
+            font-size: clamp(2.5rem, 5vw, 3.8rem);
+            letter-spacing: 0.04em;
+            line-height: 1.05;
+            margin-bottom: 2rem;
+        }
+
+        .philosophy-left h2 .serif-italic {
+            font-family: var(--font-serif);
+            font-style: italic;
+            font-weight: 400;
+            color: var(--accent);
+        }
+
+        .philosophy-left > p {
+            font-size: 1.05rem;
+            color: var(--text-secondary);
+            max-width: 440px;
+            line-height: 1.8;
+        }
+
+        .philosophy-quote {
+            margin-top: 3rem;
+            padding: 2rem 0;
+            border-top: 1px solid var(--border);
+            border-bottom: 1px solid var(--border);
+        }
+
+        .philosophy-quote blockquote {
+            font-family: var(--font-serif);
+            font-style: italic;
+            font-size: 1.3rem;
+            color: var(--text-primary);
+            line-height: 1.6;
+        }
+
+        .philosophy-quote blockquote .accent {
+            color: var(--accent);
+        }
+
+        .philosophy-pillars {
+            display: flex;
+            flex-direction: column;
+            gap: 0;
+        }
+
+        .pillar {
+            padding: 2rem 0;
+            border-bottom: 1px solid var(--border);
+            display: grid;
+            grid-template-columns: auto 1fr;
+            gap: 2rem;
+            align-items: start;
+            transition: all 0.3s ease;
+        }
+
+        .pillar:first-child {
+            border-top: 1px solid var(--border);
+        }
+
+        .pillar:hover {
+            padding-left: 1rem;
+        }
+
+        .pillar-number {
+            font-family: var(--font-display);
+            font-size: 2.5rem;
+            color: var(--accent);
+            line-height: 1;
+            opacity: 0.4;
+            transition: opacity 0.3s ease;
+        }
+
+        .pillar:hover .pillar-number {
+            opacity: 1;
+        }
+
+        .pillar h4 {
+            font-family: var(--font-display);
+            font-size: 1.3rem;
+            letter-spacing: 0.08em;
+            margin-bottom: 0.5rem;
+        }
+
+        .pillar p {
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+            line-height: 1.6;
+        }
+
+        /* ============================================
+           WHY CHOOSE US
+           ============================================ */
+        .why-us {
+            padding: 8rem 0 10rem;
+            background: var(--bg-secondary);
+            position: relative;
+        }
+
+        .why-us::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0;
+            width: 100%; height: 1px;
+            background: linear-gradient(to right, transparent, var(--border-hover), transparent);
+        }
+
+        .why-us-header {
+            text-align: center;
+            margin-bottom: 5rem;
+        }
+
+        .why-us-header h2 {
+            font-family: var(--font-display);
+            font-size: clamp(2.5rem, 5vw, 4rem);
+            letter-spacing: 0.04em;
+        }
+
+        .why-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 1.5rem;
+        }
+
+        .why-item {
+            text-align: center;
+            padding: 2.5rem 1.5rem;
+            border: 1px solid var(--border);
+            position: relative;
+            transition: all 0.4s var(--ease-out);
+        }
+
+        .why-item::after {
+            content: '';
+            position: absolute;
+            bottom: 0; left: 50%;
+            transform: translateX(-50%);
+            width: 0;
+            height: 2px;
+            background: var(--accent);
+            transition: width 0.4s var(--ease-out);
+        }
+
+        .why-item:hover {
+            border-color: var(--border-hover);
+            background: var(--bg-card);
+        }
+
+        .why-item:hover::after {
+            width: 60%;
+        }
+
+        .why-icon {
+            font-size: 2rem;
+            margin-bottom: 1.5rem;
+            color: var(--accent);
+            display: flex;
+            justify-content: center;
+        }
+
+        .why-icon svg {
+            width: 36px;
+            height: 36px;
+            stroke-width: 1.5;
+        }
+
+        .why-item h4 {
+            font-family: var(--font-display);
+            font-size: 1.2rem;
+            letter-spacing: 0.08em;
+            margin-bottom: 0.75rem;
+        }
+
+        .why-item p {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            line-height: 1.6;
+        }
+
+        /* ============================================
+           CONTACT
+           ============================================ */
+        .contact {
+            padding: 10rem 0;
+            position: relative;
+        }
+
+        .contact-layout {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 6rem;
+        }
+
+        .contact-left h2 {
+            font-family: var(--font-display);
+            font-size: clamp(2.5rem, 5vw, 3.8rem);
+            letter-spacing: 0.04em;
+            line-height: 1.05;
+            margin-bottom: 1.5rem;
+        }
+
+        .contact-left h2 .serif-italic {
+            font-family: var(--font-serif);
+            font-style: italic;
+            font-weight: 400;
+        }
+
+        .contact-left > p {
+            font-size: 1rem;
+            color: var(--text-secondary);
+            max-width: 400px;
+            margin-bottom: 3rem;
+        }
+
+        .contact-email {
+            display: inline-flex;
+            align-items: center;
+            gap: 1rem;
+            font-family: var(--font-serif);
+            font-size: 1.2rem;
+            color: var(--accent);
+            transition: color 0.3s ease;
+        }
+
+        .contact-email:hover {
+            color: var(--accent-hover);
+        }
+
+        .contact-email svg {
+            width: 18px;
+            height: 18px;
+        }
+
+        .contact-form {
+            display: flex;
+            flex-direction: column;
+            gap: 1.5rem;
+        }
+
+        .form-group {
+            position: relative;
+        }
+
+        .form-group label {
+            display: block;
+            font-size: 0.7rem;
+            letter-spacing: 0.15em;
+            text-transform: uppercase;
+            color: var(--text-muted);
+            margin-bottom: 0.5rem;
+            font-weight: 500;
+        }
+
+        .form-group input,
+        .form-group textarea {
+            width: 100%;
+            padding: 1rem 0;
+            font-family: var(--font-body);
+            font-size: 1rem;
+            font-weight: 300;
+            color: var(--text-primary);
+            background: transparent;
+            border: none;
+            border-bottom: 1px solid var(--border-hover);
+            outline: none;
+            transition: border-color 0.3s ease;
+        }
+
+        .form-group input::placeholder,
+        .form-group textarea::placeholder {
+            color: var(--text-muted);
+        }
+
+        .form-group input:focus,
+        .form-group textarea:focus {
+            border-color: var(--accent);
+        }
+
+        .form-group textarea {
+            resize: vertical;
+            min-height: 120px;
+            line-height: 1.6;
+        }
+
+        .form-submit {
+            align-self: flex-start;
+            display: inline-flex;
+            align-items: center;
+            gap: 1rem;
+            font-family: var(--font-body);
+            font-weight: 500;
+            font-size: 0.85rem;
+            letter-spacing: 0.15em;
+            text-transform: uppercase;
+            color: var(--bg-primary);
+            background: var(--accent);
+            padding: 1rem 2.5rem;
+            border: none;
+            cursor: pointer;
+            transition: all 0.4s var(--ease-out);
+            margin-top: 1rem;
+        }
+
+        .form-submit:hover {
+            background: var(--accent-hover);
+            transform: translateY(-2px);
+            box-shadow: 0 10px 40px rgba(196, 70, 58, 0.3);
+        }
+
+        .form-submit svg {
+            width: 16px;
+            height: 16px;
+            transition: transform 0.3s ease;
+        }
+
+        .form-submit:hover svg {
+            transform: translateX(4px);
+        }
+
+        .form-submit:disabled {
+            opacity: 0.7;
+            cursor: not-allowed;
+            transform: none !important;
+            box-shadow: none !important;
+        }
+
+        .form-submit .spinner {
+            width: 16px;
+            height: 16px;
+            border: 2px solid rgba(26, 26, 26, 0.3);
+            border-top-color: var(--bg-primary);
+            border-radius: 50%;
+            animation: spin 0.6s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* Form validation */
+        .form-group input.error,
+        .form-group textarea.error {
+            border-color: #d9534f;
+        }
+
+        .form-error-msg {
+            font-size: 0.75rem;
+            color: #d9534f;
+            margin-top: 0.4rem;
+            display: none;
+        }
+
+        .form-error-msg.show {
+            display: block;
+        }
+
+        /* Toast notification */
+        .toast {
+            position: fixed;
+            bottom: 2rem;
+            right: 2rem;
+            padding: 1.25rem 2rem;
+            border-radius: 2px;
+            font-family: var(--font-body);
+            font-size: 0.9rem;
+            font-weight: 400;
+            color: var(--text-primary);
+            z-index: 10000;
+            transform: translateY(120%);
+            opacity: 0;
+            transition: all 0.5s var(--ease-out);
+            max-width: 420px;
+            border-left: 3px solid;
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+        }
+
+        .toast.visible {
+            transform: translateY(0);
+            opacity: 1;
+        }
+
+        .toast.success {
+            background: rgba(42, 110, 74, 0.9);
+            border-color: #3ecf8e;
+        }
+
+        .toast.error {
+            background: rgba(180, 50, 45, 0.9);
+            border-color: #d9534f;
+        }
+
+        .toast-content {
+            display: flex;
+            align-items: flex-start;
+            gap: 0.75rem;
+        }
+
+        .toast-icon {
+            flex-shrink: 0;
+            margin-top: 1px;
+        }
+
+        .toast-icon svg {
+            width: 18px;
+            height: 18px;
+        }
+
+        .toast-text strong {
+            display: block;
+            font-weight: 500;
+            margin-bottom: 0.2rem;
+        }
+
+        .toast-text span {
+            font-size: 0.8rem;
+            opacity: 0.85;
+        }
+
+        @media (max-width: 480px) {
+            .toast {
+                left: 1rem;
+                right: 1rem;
+                bottom: 1rem;
+                max-width: none;
+            }
+        }
+
+        /* ============================================
+           FOOTER
+           ============================================ */
+        .footer {
+            padding: 3rem 0;
+            border-top: 1px solid var(--border);
+            background: var(--bg-secondary);
+        }
+
+        .footer-inner {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .footer-logo {
+            font-family: var(--font-display);
+            font-size: 1.2rem;
+            letter-spacing: 0.05em;
+        }
+
+        .footer-logo .dot {
+            color: var(--accent);
+        }
+
+        .footer-copy {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+        }
+
+        .footer-tagline {
+            font-family: var(--font-serif);
+            font-style: italic;
+            font-size: 0.85rem;
+            color: var(--text-muted);
+        }
+
+        /* ============================================
+           RESPONSIVE
+           ============================================ */
+        @media (max-width: 1024px) {
+            .about-grid,
+            .philosophy-layout,
+            .contact-layout {
+                grid-template-columns: 1fr;
+                gap: 4rem;
+            }
+
+            .why-grid {
+                grid-template-columns: 1fr 1fr;
+            }
+
+            .hero-code-deco {
+                display: none;
+            }
+        }
+
+        @media (max-width: 768px) {
+            .nav-links {
+                position: fixed;
+                top: 0;
+                right: -100%;
+                width: 80%;
+                max-width: 360px;
+                height: 100vh;
+                background: var(--bg-secondary);
+                flex-direction: column;
+                justify-content: center;
+                padding: 2rem;
+                gap: 2rem;
+                transition: right 0.5s var(--ease-out);
+                border-left: 1px solid var(--border);
+            }
+
+            .nav-links.open {
+                right: 0;
+            }
+
+            .nav-toggle {
+                display: flex;
+                z-index: 1001;
+            }
+
+            .services-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .why-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .about-word-art {
+                font-size: 4rem;
+            }
+
+            .hero {
+                padding-top: 6rem;
+            }
+
+            .hero-scroll-hint {
+                display: none;
+            }
+
+            .footer-inner {
+                flex-direction: column;
+                gap: 1rem;
+                text-align: center;
+            }
+        }
+
+        @media (max-width: 480px) {
+            .about-grid,
+            .philosophy-layout,
+            .contact-layout {
+                gap: 3rem;
+            }
+
+            .philosophy-layout {
+                gap: 3rem;
+            }
+
+            .pillar {
+                grid-template-columns: 1fr;
+                gap: 0.5rem;
+            }
+
+            .pillar-number {
+                font-size: 1.8rem;
+            }
+        }
+
+        /* ============================================
+           MOBILE NAV OVERLAY
+           ============================================ */
+        .nav-overlay {
+            position: fixed;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            background: rgba(0,0,0,0.5);
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.4s ease;
+            z-index: 998;
+        }
+
+        .nav-overlay.active {
+            opacity: 1;
+            pointer-events: all;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- NAV OVERLAY (mobile) -->
+    <div class="nav-overlay" id="navOverlay"></div>
+
+    <!-- NAVIGATION -->
+    <nav class="nav" id="nav" role="navigation" aria-label="Main navigation">
+        <div class="container nav-inner">
+            <a href="#hero" class="nav-logo" aria-label="CulChar Home">
+                CUL<span class="dot">.</span>CHAR
+            </a>
+            <button class="nav-toggle" id="navToggle" aria-label="Toggle navigation menu" aria-expanded="false">
+                <span></span><span></span><span></span>
+            </button>
+            <ul class="nav-links" id="navLinks" role="menubar">
+                <li role="none"><a href="#about" role="menuitem">About</a></li>
+                <li role="none"><a href="#services" role="menuitem">Services</a></li>
+                <li role="none"><a href="#philosophy" role="menuitem">Approach</a></li>
+                <li role="none"><a href="#why-us" role="menuitem">Why Us</a></li>
+                <li role="none"><a href="#contact" role="menuitem" class="nav-cta">Get in Touch</a></li>
+            </ul>
+        </div>
+    </nav>
+
+    <!-- HERO SECTION -->
+    <section class="hero" id="hero" aria-label="Hero">
+        <div class="hero-bg-grid" aria-hidden="true"></div>
+        <div class="hero-glow" aria-hidden="true"></div>
+
+        <div class="hero-code-deco" aria-hidden="true">const culture = {
+  team: 'cohesive',
+  approach: 'modern',
+  focus: 'fundamentals'
+};
+
+function build(client) {
+  return adapt(
+    client.culture,
+    culture
+  );
+}</div>
+
+        <div class="container hero-content">
+            <p class="hero-eyebrow">Software Development Studio &bull; Estd. 2026</p>
+            <h1 class="hero-title">CUL<span class="dot">.</span>CHAR</h1>
+            <p class="hero-tagline">&ldquo;The code we live by.&rdquo;</p>
+            <p class="hero-description">Websites and mobile applications, built for your culture.</p>
+            <a href="#contact" class="hero-cta">
+                Let&rsquo;s Talk
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+            </a>
+        </div>
+
+        <div class="hero-scroll-hint" aria-hidden="true">
+            <span>Scroll</span>
+            <div class="scroll-line"></div>
+        </div>
+    </section>
+
+    <!-- ABOUT / NAME STORY -->
+    <section class="about" id="about" aria-label="About CulChar">
+        <div class="container about-grid">
+            <div class="about-visual reveal">
+                <div class="about-word-art" aria-hidden="true">
+                    CUL<br>CHAR
+                </div>
+                <p class="about-pronunciation">/ˈkʌl.tʃər/ — pronounced "Culture"</p>
+
+                <div class="about-meaning-cards">
+                    <div class="meaning-card reveal reveal-delay-1">
+                        <h4>CUL — CULTURE</h4>
+                        <p>Understanding your business ethos. We immerse ourselves in how your organisation thinks, operates, and connects with its audience — then build software that fits.</p>
+                    </div>
+                    <div class="meaning-card reveal reveal-delay-2">
+                        <h4>CHAR — THE VARIABLE</h4>
+                        <p>In programming, <em>char</em> is a fundamental variable type — the building block of every string, every message, every interaction. It represents our obsession with getting the foundations right.</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="about-text reveal reveal-delay-2">
+                <span class="section-label">Our Story</span>
+                <h2>MORE THAN A NAME.<br>IT'S HOW WE <span class="accent">BUILD</span>.</h2>
+                <p>CulChar was born from a simple belief: great software doesn't just solve problems — it reflects the people and values behind the business it serves.</p>
+                <p>Our name is a deliberate fusion. "Culture" speaks to our dual commitment — understanding the unique ethos of every client's business, and nurturing a cohesive, close-knit team culture within our own studio.</p>
+                <div class="about-divider" aria-hidden="true"></div>
+                <p>"Char" is a nod to the fundamentals of programming. Just as the <em>char</em> variable is the smallest meaningful unit in code, we believe exceptional software is built from meticulous attention to the details that matter most.</p>
+                <p>We're not a collection of freelancers assembled for a project. We're a dedicated team, operating with shared values and modern development techniques, committed to delivering work we're proud to stand behind.</p>
+            </div>
+        </div>
+    </section>
+
+    <!-- SERVICES -->
+    <section class="services" id="services" aria-label="Our Services">
+        <div class="container">
+            <div class="services-header reveal">
+                <span class="section-label">What We Do</span>
+                <h2>SERVICES</h2>
+                <p>Software crafted with culture in mind, built with precision at its core.</p>
+            </div>
+
+            <div class="services-grid">
+                <div class="service-card reveal reveal-delay-1">
+                    <div class="service-icon" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                            <polyline points="16 18 22 12 16 6"></polyline>
+                            <polyline points="8 6 2 12 8 18"></polyline>
+                            <line x1="14" y1="4" x2="10" y2="20"></line>
+                        </svg>
+                    </div>
+                    <h3>WEBSITE DEVELOPMENT</h3>
+                    <p>From single-page marketing sites to complex web applications, we design and develop digital experiences that embody your brand's character. Every interaction is intentional, every line of code purposeful.</p>
+                    <div class="service-tags" aria-label="Technologies">
+                        <span>React</span>
+                        <span>Next.js</span>
+                        <span>Node.js</span>
+                        <span>Responsive</span>
+                        <span>E-commerce</span>
+                        <span>CMS</span>
+                    </div>
+                </div>
+
+                <div class="service-card reveal reveal-delay-2">
+                    <div class="service-icon" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                            <rect x="5" y="2" width="14" height="20" rx="2" ry="2"></rect>
+                            <line x1="12" y1="18" x2="12.01" y2="18"></line>
+                        </svg>
+                    </div>
+                    <h3>MOBILE APPLICATIONS</h3>
+                    <p>Native and cross-platform mobile applications for iOS and Android. We build apps that feel intuitive in your users' hands, designed around the behaviours and expectations of your audience's culture.</p>
+                    <div class="service-tags" aria-label="Technologies">
+                        <span>iOS</span>
+                        <span>Android</span>
+                        <span>React Native</span>
+                        <span>Flutter</span>
+                        <span>UI/UX</span>
+                        <span>API</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- PHILOSOPHY / APPROACH -->
+    <section class="philosophy" id="philosophy" aria-label="Our Approach">
+        <div class="container philosophy-layout">
+            <div class="philosophy-left reveal">
+                <span class="section-label">Our Approach</span>
+                <h2>SOFTWARE THAT<br>ADAPTS TO <span class="serif-italic">your</span><br>CULTURE</h2>
+                <p>We don't believe in one-size-fits-all solutions. Every project begins with understanding — your business, your audience, your values. Then we build software that feels like a natural extension of who you are.</p>
+
+                <div class="philosophy-quote reveal reveal-delay-1">
+                    <blockquote>"The code we live by" isn't just a tagline. It's our <span class="accent">technical standard</span> and our <span class="accent">values system</span>, inseparable by design.</blockquote>
+                </div>
+            </div>
+
+            <div class="philosophy-pillars reveal reveal-delay-1">
+                <div class="pillar">
+                    <span class="pillar-number">01</span>
+                    <div>
+                        <h4>CULTURE-FIRST DISCOVERY</h4>
+                        <p>Before we write a single line of code, we learn how your business thinks. Your culture is the brief — the technology follows.</p>
+                    </div>
+                </div>
+                <div class="pillar">
+                    <span class="pillar-number">02</span>
+                    <div>
+                        <h4>COHESIVE TEAM, NOT CONTRACTORS</h4>
+                        <p>We're a tight-knit studio, not a marketplace of freelancers. Our team communicates daily, shares context deeply, and owns every project collectively.</p>
+                    </div>
+                </div>
+                <div class="pillar">
+                    <span class="pillar-number">03</span>
+                    <div>
+                        <h4>MODERN TECHNIQUES, CLEAN CODE</h4>
+                        <p>We leverage the latest frameworks and development practices — not for novelty, but for performance, maintainability, and long-term value.</p>
+                    </div>
+                </div>
+                <div class="pillar">
+                    <span class="pillar-number">04</span>
+                    <div>
+                        <h4>FUNDAMENTALS FIRST</h4>
+                        <p>Like the <em>char</em> in our name, we obsess over the building blocks. Strong foundations lead to software that scales gracefully and ages well.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- WHY CHOOSE US -->
+    <section class="why-us" id="why-us" aria-label="Why Choose CulChar">
+        <div class="container">
+            <div class="why-us-header reveal">
+                <span class="section-label">The Difference</span>
+                <h2>WHY CULCHAR</h2>
+            </div>
+
+            <div class="why-grid">
+                <div class="why-item reveal reveal-delay-1">
+                    <div class="why-icon" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                            <circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+                        </svg>
+                    </div>
+                    <h4>CULTURE-FIRST</h4>
+                    <p>Your business culture is our starting point, not an afterthought. We build software that feels native to your organisation.</p>
+                </div>
+
+                <div class="why-item reveal reveal-delay-2">
+                    <div class="why-icon" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                            <polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/>
+                        </svg>
+                    </div>
+                    <h4>MODERN STACK</h4>
+                    <p>React, Node, Flutter, Swift — we choose the right tools for the job, always current, always performant.</p>
+                </div>
+
+                <div class="why-item reveal reveal-delay-3">
+                    <div class="why-icon" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+                        </svg>
+                    </div>
+                    <h4>DEDICATED TEAM</h4>
+                    <p>A cohesive studio of developers and designers who share context, standards, and a genuine commitment to your success.</p>
+                </div>
+
+                <div class="why-item reveal reveal-delay-4">
+                    <div class="why-icon" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                            <polyline points="16 18 22 12 16 6"></polyline>
+                            <polyline points="8 6 2 12 8 18"></polyline>
+                        </svg>
+                    </div>
+                    <h4>THE CHAR PHILOSOPHY</h4>
+                    <p>Obsessive attention to fundamentals. Clean code, solid architecture, and meticulous craftsmanship at every level.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- CONTACT -->
+    <section class="contact" id="contact" aria-label="Contact Us">
+        <div class="container contact-layout">
+            <div class="contact-left reveal">
+                <span class="section-label">Start a Conversation</span>
+                <h2>LET'S BUILD<br>SOMETHING <span class="serif-italic">together.</span></h2>
+                <p>Whether you have a clear vision or just the seed of an idea, we'd love to hear about it. Tell us about your project, and let's explore how we can bring it to life — built for your culture.</p>
+
+                <a href="mailto:muzi.mlimi@gmail.com" class="contact-email">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/>
+                    </svg>
+                    muzi.mlimi@gmail.com
+                </a>
+            </div>
+
+            <form class="contact-form reveal reveal-delay-1" id="contactForm" novalidate>
+                <!-- Formsubmit.co Configuration — no API key needed -->
+                <input type="hidden" name="_subject" value="New enquiry from CulChar website">
+                <input type="hidden" name="_captcha" value="false">
+                <input type="hidden" name="_template" value="table">
+                <!-- Honeypot spam protection -->
+                <input type="text" name="_honey" style="display:none">
+
+                <div class="form-group">
+                    <label for="name">Your Name</label>
+                    <input type="text" id="name" name="name" placeholder="What should we call you?" required autocomplete="name">
+                    <p class="form-error-msg" id="nameError">Please enter your name.</p>
+                </div>
+                <div class="form-group">
+                    <label for="email">Email Address</label>
+                    <input type="email" id="email" name="email" placeholder="Where can we reach you?" required autocomplete="email">
+                    <p class="form-error-msg" id="emailError">Please enter a valid email address.</p>
+                </div>
+                <div class="form-group">
+                    <label for="project">Project Brief</label>
+                    <textarea id="project" name="message" placeholder="Tell us about your project — what you need, who it's for, and any vision you have in mind." required></textarea>
+                    <p class="form-error-msg" id="projectError">Please tell us about your project.</p>
+                </div>
+                <button type="submit" class="form-submit" id="submitBtn">
+                    <span class="btn-text">Send Message</span>
+                    <svg class="btn-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+                </button>
+            </form>
+        </div>
+    </section>
+
+    <!-- TOAST NOTIFICATION -->
+    <div class="toast" id="toast" role="alert" aria-live="polite">
+        <div class="toast-content">
+            <div class="toast-icon" id="toastIcon"></div>
+            <div class="toast-text">
+                <strong id="toastTitle"></strong>
+                <span id="toastMessage"></span>
+            </div>
+        </div>
+    </div>
+
+    <!-- FOOTER -->
+    <footer class="footer" role="contentinfo">
+        <div class="container footer-inner">
+            <div class="footer-logo">CUL<span class="dot">.</span>CHAR</div>
+            <p class="footer-tagline">The code we live by.</p>
+            <p class="footer-copy">&copy; <span id="currentYear"></span> CulChar. All rights reserved.</p>
+        </div>
+    </footer>
+
+
+    <!-- ============================================
+         JAVASCRIPT
+         ============================================ -->
+    <script>
+        // ---- Current Year ----
+        document.getElementById('currentYear').textContent = new Date().getFullYear();
+
+        // ---- Scroll-based nav styling ----
+        const nav = document.getElementById('nav');
+        let lastScroll = 0;
+
+        window.addEventListener('scroll', () => {
+            const currentScroll = window.pageYOffset;
+            if (currentScroll > 60) {
+                nav.classList.add('scrolled');
+            } else {
+                nav.classList.remove('scrolled');
+            }
+            lastScroll = currentScroll;
+        }, { passive: true });
+
+        // ---- Mobile nav toggle ----
+        const navToggle = document.getElementById('navToggle');
+        const navLinks = document.getElementById('navLinks');
+        const navOverlay = document.getElementById('navOverlay');
+
+        function toggleNav() {
+            const isOpen = navLinks.classList.toggle('open');
+            navToggle.classList.toggle('active');
+            navOverlay.classList.toggle('active');
+            navToggle.setAttribute('aria-expanded', isOpen);
+            document.body.style.overflow = isOpen ? 'hidden' : '';
+        }
+
+        navToggle.addEventListener('click', toggleNav);
+        navOverlay.addEventListener('click', toggleNav);
+
+        // Close mobile nav on link click
+        navLinks.querySelectorAll('a').forEach(link => {
+            link.addEventListener('click', () => {
+                if (navLinks.classList.contains('open')) toggleNav();
+            });
+        });
+
+        // ---- Scroll reveal (IntersectionObserver) ----
+        const revealElements = document.querySelectorAll('.reveal');
+
+        const observer = new IntersectionObserver((entries) => {
+            entries.forEach(entry => {
+                if (entry.isIntersecting) {
+                    entry.target.classList.add('visible');
+                    observer.unobserve(entry.target);
+                }
+            });
+        }, {
+            threshold: 0.1,
+            rootMargin: '0px 0px -60px 0px'
+        });
+
+        revealElements.forEach(el => observer.observe(el));
+
+        // ---- Smooth scroll for anchor links ----
+        document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+            anchor.addEventListener('click', (e) => {
+                e.preventDefault();
+                const target = document.querySelector(anchor.getAttribute('href'));
+                if (target) {
+                    const offset = 80;
+                    const top = target.getBoundingClientRect().top + window.pageYOffset - offset;
+                    window.scrollTo({ top, behavior: 'smooth' });
+                }
+            });
+        });
+
+        // ---- Toast notification system ----
+        function showToast(type, title, message) {
+            const toast = document.getElementById('toast');
+            const toastIcon = document.getElementById('toastIcon');
+            const toastTitle = document.getElementById('toastTitle');
+            const toastMessage = document.getElementById('toastMessage');
+
+            toast.className = 'toast ' + type;
+            toastTitle.textContent = title;
+            toastMessage.textContent = message;
+
+            if (type === 'success') {
+                toastIcon.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>';
+            } else {
+                toastIcon.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>';
+            }
+
+            requestAnimationFrame(() => toast.classList.add('visible'));
+
+            setTimeout(() => {
+                toast.classList.remove('visible');
+            }, 5000);
+        }
+
+        // ---- Inline field validation ----
+        function validateField(input, errorEl, validationFn) {
+            const value = input.value.trim();
+            const isValid = validationFn(value);
+            input.classList.toggle('error', !isValid);
+            errorEl.classList.toggle('show', !isValid);
+            return isValid;
+        }
+
+        // ---- Contact form — Formsubmit.co integration ----
+        const contactForm = document.getElementById('contactForm');
+        const submitBtn = document.getElementById('submitBtn');
+        const nameInput = document.getElementById('name');
+        const emailInput = document.getElementById('email');
+        const projectInput = document.getElementById('project');
+        const nameError = document.getElementById('nameError');
+        const emailError = document.getElementById('emailError');
+        const projectError = document.getElementById('projectError');
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+        // Clear errors on input
+        [nameInput, emailInput, projectInput].forEach((input) => {
+            input.addEventListener('input', () => {
+                input.classList.remove('error');
+                const errorEl = document.getElementById(input.id + 'Error');
+                if (errorEl) errorEl.classList.remove('show');
+            });
+        });
+
+        contactForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            // Validate all fields
+            const isNameValid = validateField(nameInput, nameError, v => v.length > 0);
+            const isEmailValid = validateField(emailInput, emailError, v => emailRegex.test(v));
+            const isProjectValid = validateField(projectInput, projectError, v => v.length > 0);
+
+            if (!isNameValid || !isEmailValid || !isProjectValid) {
+                const firstInvalid = contactForm.querySelector('.error');
+                if (firstInvalid) firstInvalid.focus();
+                return;
+            }
+
+            // Set loading state
+            const btnText = submitBtn.querySelector('.btn-text');
+            const btnArrow = submitBtn.querySelector('.btn-arrow');
+            const originalText = btnText.textContent;
+            const senderName = nameInput.value.trim().split(' ')[0];
+
+            btnText.textContent = 'Sending...';
+            btnArrow.style.display = 'none';
+
+            const spinner = document.createElement('div');
+            spinner.className = 'spinner';
+            submitBtn.appendChild(spinner);
+            submitBtn.disabled = true;
+
+            try {
+                const formData = new FormData(contactForm);
+
+                const response = await fetch('https://formsubmit.co/ajax/muzi.mlimi@gmail.com', {
+                    method: 'POST',
+                    headers: { 'Accept': 'application/json' },
+                    body: formData
+                });
+
+                const result = await response.json();
+
+                if (result.success === 'true' || result.success === true) {
+                    showToast(
+                        'success',
+                        'Message sent!',
+                        'Thanks ' + senderName + ', we\'ll be in touch soon.'
+                    );
+                    contactForm.reset();
+                } else {
+                    throw new Error(result.message || 'Submission failed');
+                }
+            } catch (error) {
+                console.error('Form submission error:', error);
+                showToast(
+                    'error',
+                    'Something went wrong',
+                    'Please try again or email us directly at muzi.mlimi@gmail.com'
+                );
+            } finally {
+                btnText.textContent = originalText;
+                btnArrow.style.display = '';
+                if (spinner.parentNode) spinner.remove();
+                submitBtn.disabled = false;
+            }
+        });
+    </script>
+</body>
+</html>
