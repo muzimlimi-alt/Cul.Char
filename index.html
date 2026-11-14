@@ -202,8 +202,8 @@ body.panel-open .view.active > *:nth-child(n+5){animation-delay:1s}
 .card em,.prose em{font-style:normal;font-family:'Courier New',monospace;font-size:.92em;color:var(--text)}
 .card .ico{width:48px;height:48px;border:1px solid var(--line-2);display:grid;place-items:center;color:var(--accent-2);margin-bottom:1.3rem}
 .card .ico svg{width:22px;height:22px}
-.card .tags{display:flex;flex-wrap:wrap;gap:.45rem;margin-top:1.2rem}
-.card .tags span{font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;padding:.3rem .65rem;border:1px solid var(--line);color:var(--text-2)}
+.card .tags,.work-tags{display:flex;flex-wrap:wrap;gap:.45rem;margin-top:1.2rem}
+.card .tags span,.work-tags span{font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;padding:.3rem .65rem;border:1px solid var(--line);color:var(--text-2)}
 .prose{max-width:620px;margin:2.5rem auto 0;text-align:center;color:var(--text-2);font-size:.98rem;line-height:1.8}
 .prose p+p{margin-top:1.2rem}
 .pronounce{font-family:var(--serif);font-style:italic;font-size:1.35rem;color:var(--accent-2);text-align:center;margin:-1.6rem 0 2.5rem}
@@ -224,15 +224,62 @@ body.panel-open .view.active > *:nth-child(n+5){animation-delay:1s}
 .why p{font-size:.86rem}
 .cta-row{display:flex;flex-wrap:wrap;justify-content:center;gap:1rem;margin-top:2.5rem}
 
+/* Process steps */
+.process-title{font-family:var(--display);font-weight:400;font-size:1.7rem;letter-spacing:.08em;text-align:center;margin:4.5rem 0 .4rem}
+.process-sub{text-align:center;color:var(--text-2);font-size:.88rem;margin-bottom:2rem}
+.steps{list-style:none;display:grid;grid-template-columns:repeat(6,1fr);gap:1rem;counter-reset:step}
+.steps li{position:relative;padding:1.4rem 1.1rem;border-top:2px solid var(--accent);background:var(--card);counter-increment:step}
+.steps li::before{content:counter(step,decimal-leading-zero);font-family:var(--display);font-size:1.6rem;color:var(--accent-2);display:block;margin-bottom:.4rem}
+.steps h4{font-family:var(--display);font-weight:400;font-size:1.15rem;letter-spacing:.08em;margin-bottom:.35rem}
+.steps p{font-size:.82rem;color:var(--text-2);line-height:1.55}
+
+/* Work */
+.work{display:grid;grid-template-columns:1.6fr 1fr;gap:1.1rem}
+.work-card{border:1px solid var(--line);background:var(--card);display:flex;flex-direction:column}
+.work-visual{aspect-ratio:16/9;background:radial-gradient(70% 90% at 80% 10%,rgba(212,175,55,.22),transparent 60%),linear-gradient(160deg,#16130d,#090807);display:grid;place-items:center;border-bottom:1px solid var(--line);position:relative;overflow:hidden}
+.work-visual::before{content:'';position:absolute;inset:12% 10%;border:1px solid rgba(212,175,55,.35)}
+.work-visual span{font-family:var(--serif);font-style:italic;font-size:clamp(1.6rem,3.2vw,2.6rem);color:#e9d8a6;position:relative;letter-spacing:.02em}
+.work-visual small{position:absolute;bottom:16%;left:0;right:0;text-align:center;font-size:.6rem;letter-spacing:.35em;text-transform:uppercase;color:rgba(233,216,166,.7)}
+.work-body{padding:1.6rem 1.7rem 1.8rem}
+.work-body .kicker{font-size:.66rem;letter-spacing:.2em;text-transform:uppercase;color:var(--accent-2);margin-bottom:.5rem}
+.work-body h3{font-family:var(--display);font-weight:400;font-size:1.8rem;letter-spacing:.06em;margin-bottom:.6rem}
+.work-body p{font-size:.9rem;color:var(--text-2);line-height:1.7}
+.work-card.next{justify-content:center;align-items:center;text-align:center;padding:2.5rem 1.8rem;border-style:dashed}
+.work-card.next h3{font-family:var(--display);font-weight:400;font-size:2rem;letter-spacing:.06em;margin-bottom:.6rem}
+.work-card.next p{font-size:.9rem;color:var(--text-2);line-height:1.7;margin-bottom:1.6rem;max-width:300px}
+
+/* Legal */
+.legal{max-width:760px;margin:0 auto}
+.legal section{padding:2rem 0;border-top:1px solid var(--line)}
+.legal h3{font-family:var(--display);font-weight:400;font-size:1.7rem;letter-spacing:.08em;margin-bottom:1rem}
+.legal h4{font-size:.78rem;letter-spacing:.16em;text-transform:uppercase;font-weight:500;color:var(--text);margin:1.4rem 0 .4rem}
+.legal p,.legal li{font-size:.9rem;color:var(--text-2);line-height:1.75}
+.legal ul{padding-left:1.2rem;margin-top:.3rem}
+.legal a{color:var(--text);text-decoration-color:var(--accent)}
+.legal .updated{font-size:.75rem;color:var(--text-3);margin-top:1.5rem}
+.footnote button{background:none;border:0;cursor:pointer;color:var(--text-2);font:inherit;letter-spacing:inherit;text-decoration:underline;text-decoration-color:var(--line-2);text-underline-offset:3px;padding:0 .15rem}
+.footnote button:hover{color:var(--text)}
+
+/* Form additions */
+.form{max-width:640px}
+.form .row{display:grid;grid-template-columns:1fr 1fr;gap:1.4rem}
+.field .opt{text-transform:none;letter-spacing:0;color:var(--text-3);font-weight:300}
+.consent{display:grid;grid-template-columns:auto 1fr;gap:.75rem;align-items:start;font-size:.84rem;color:var(--text-2);line-height:1.6}
+.consent input{width:18px;height:18px;margin-top:.2rem;accent-color:var(--accent)}
+.consent button{background:none;border:0;padding:0;font:inherit;color:var(--text);text-decoration:underline;text-decoration-color:var(--accent);cursor:pointer}
+.consent .err{display:none;grid-column:2;font-size:.75rem;color:#ff8a7e}
+.consent.invalid .err{display:block}
+
 /* Toast */
 .toast{position:fixed;left:50%;bottom:1.5rem;transform:translate(-50%,250%);visibility:hidden;z-index:300;padding:1rem 1.5rem;background:#1f1f1f;border-left:3px solid var(--accent);font-size:.88rem;max-width:calc(100% - 2rem);transition:transform .5s var(--ease-out)}
 .toast.ok{border-color:#3ecf8e}
 .toast.show{transform:translate(-50%,0);visibility:visible}
 
 /* ---------- Responsive ---------- */
-@media (max-width:1080px){.packages,.why{grid-template-columns:1fr 1fr}}
+@media (max-width:1080px){.packages,.why{grid-template-columns:1fr 1fr}.steps{grid-template-columns:repeat(3,1fr)}}
 @media (max-width:760px){
-  .packages,.plans,.hosting,.cards,.why{grid-template-columns:1fr}
+  .packages,.plans,.hosting,.cards,.why,.work,.form .row{grid-template-columns:1fr}
+  .steps{grid-template-columns:1fr 1fr}
   .pillar{grid-template-columns:1fr;gap:.4rem}
   .pkg .for{min-height:0}
   .logo-sub{justify-content:center}
@@ -293,12 +340,12 @@ body.panel-open .view.active > *:nth-child(n+5){animation-delay:1s}
         <button data-open="about">About</button>
         <button data-open="services">Services</button>
         <button data-open="approach">Approach</button>
-        <button data-open="why">Why us</button>
+        <button data-open="work">Work</button>
         <button data-open="packages">Packages</button>
       </nav>
     </div>
 
-    <p class="footnote">&copy; <span class="year"></span> CulChar (pronounced &ldquo;Culture&rdquo;) &middot; Website design &amp; development &middot; South Africa</p>
+    <p class="footnote">&copy; <span class="year"></span> CulChar (pronounced &ldquo;Culture&rdquo;) &middot; South Africa &middot; <button data-open="legal">Privacy</button> <button data-open="legal">Terms</button> <button data-open="legal">PAIA</button></p>
   </main>
 
   <!-- ================= SLIDE-UP PANEL ================= -->
@@ -311,6 +358,7 @@ body.panel-open .view.active > *:nth-child(n+5){animation-delay:1s}
       <button data-open="about">About</button>
       <button data-open="services">Services</button>
       <button data-open="approach">Approach</button>
+      <button data-open="work">Work</button>
       <button data-open="why">Why us</button>
       <button data-open="packages">Packages</button>
       <button data-open="contact">Contact</button>
@@ -374,6 +422,18 @@ body.panel-open .view.active > *:nth-child(n+5){animation-delay:1s}
         <div class="pillar"><span class="n">04</span><div><h4>Fundamentals first</h4><p>Like the <em>char</em> in our name, we obsess over the building blocks. Strong foundations make software that scales gracefully and ages well.</p></div></div>
       </div>
       <p class="quote">&ldquo;The code we live by&rdquo; isn&rsquo;t just a tagline. It&rsquo;s our <em>technical standard</em> and our <em>values system</em>, inseparable by design.</p>
+      <div>
+        <h3 class="process-title">How a project runs</h3>
+        <p class="process-sub">Six steps, with your sign-off before each big move.</p>
+        <ol class="steps">
+          <li><h4>Discovery</h4><p>A requirements session, then a sitemap, feature list and written scope.</p></li>
+          <li><h4>Proposal</h4><p>Fixed scope and price in a signed proposal. A deposit starts the work.</p></li>
+          <li><h4>Design</h4><p>Your brand applied to CulChar layouts, with two rounds of revisions.</p></li>
+          <li><h4>Build</h4><p>Development on a private staging link so you can see progress and sign it off.</p></li>
+          <li><h4>Test &amp; launch</h4><p>Functional, mobile and browser testing, then domain, SSL and go-live.</p></li>
+          <li><h4>Handover &amp; care</h4><p>A training session and admin guide, then a care plan keeps it secure.</p></li>
+        </ol>
+      </div>
     </div>
 
     <div class="view" id="view-why">
@@ -386,6 +446,76 @@ body.panel-open .view.active > *:nth-child(n+5){animation-delay:1s}
         <article class="card"><div class="ico" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg></div><h3>The char philosophy</h3><p>Attention to fundamentals. Clean code, solid architecture and careful craftsmanship at every level.</p></article>
       </div>
       <div class="cta-row"><button class="submit" data-open="contact">Let&rsquo;s talk</button></div>
+    </div>
+
+    <div class="view" id="view-work">
+      <h2 class="view-title">Selected <em>work</em>.</h2>
+      <p class="view-intro">Every build starts with the client&rsquo;s culture. Here&rsquo;s what that has looked like so far.</p>
+      <div class="work">
+        <article class="work-card">
+          <div class="work-visual" aria-hidden="true"><span>Editorial-luxe</span><small>Entertainer &middot; Website &amp; platform</small></div>
+          <div class="work-body">
+            <p class="kicker">Website &amp; business platform</p>
+            <h3>Thabiso Mhlongo</h3>
+            <p>A website for a South African entertainer, designed in an editorial-luxe style, with the business system behind it: booking enquiries, a client CRM, PDF quotes with online acceptance, invoicing and payments, and events with online ticketing.</p>
+            <div class="tags work-tags"><span>Website</span><span>Booking &amp; CRM</span><span>Quotes &amp; invoicing</span><span>PayFast</span><span>Ticketing</span><span>Admin portal</span></div>
+          </div>
+        </article>
+        <article class="work-card next">
+          <h3>Your project next</h3>
+          <p>Tell us about your business and what you need. We&rsquo;ll come back with a scope and a fixed price.</p>
+          <button class="submit" data-open="contact">Start a project</button>
+        </article>
+      </div>
+    </div>
+
+    <div class="view" id="view-legal">
+      <h2 class="view-title">Privacy &amp; <em>terms</em>.</h2>
+      <p class="view-intro">How we handle your information, and the terms that apply to this website and our work.</p>
+      <div class="legal">
+        <section id="privacy">
+          <h3>Privacy notice</h3>
+          <p>CulChar is a website design and development business in South Africa. This notice explains what personal information this website collects and how we use it, in line with the Protection of Personal Information Act (POPIA).</p>
+          <h4>What we collect</h4>
+          <p>Only what you send us through the contact form: your name and email address, and, if you choose to give them, your phone number, business name, the package you&rsquo;re interested in, your budget range, your timeframe and your message. This site does not use analytics, advertising or tracking cookies.</p>
+          <h4>Why we use it</h4>
+          <p>To reply to your enquiry, discuss your project and prepare a proposal. We don&rsquo;t sell your information or use it for marketing without your consent.</p>
+          <h4>Who else handles it</h4>
+          <ul>
+            <li><strong>FormSubmit</strong> (formsubmit.co) receives the contact form and forwards it to us by email.</li>
+            <li><strong>Google Fonts</strong> supplies the fonts on this page, so your browser requests them from Google, which receives your IP address.</li>
+          </ul>
+          <p>These services may process information outside South Africa.</p>
+          <h4>How long we keep it</h4>
+          <p>Only as long as we need it to respond to you and follow up. If your enquiry becomes a project, your details become part of the client record covered by your agreement with us.</p>
+          <h4>Your rights</h4>
+          <p>You can ask us what information we hold about you, and ask us to correct or delete it, by emailing <a href="mailto:muzi.mlimi@gmail.com">muzi.mlimi@gmail.com</a>. If you&rsquo;re unhappy with how we&rsquo;ve handled your information, you can complain to the <a href="https://inforegulator.org.za" target="_blank" rel="noopener">Information Regulator</a>.</p>
+          <h4>Information officer</h4>
+          <p>The owner of CulChar, reachable at <a href="mailto:muzi.mlimi@gmail.com">muzi.mlimi@gmail.com</a>.</p>
+        </section>
+
+        <section id="terms">
+          <h3>Terms</h3>
+          <h4>Using this website</h4>
+          <p>The information on this website is general. Prices are in South African rand and may change; CulChar is not VAT-registered, so no VAT is charged. A price becomes binding only in a signed proposal. The content and design of this site belong to CulChar.</p>
+          <h4>How we work with clients</h4>
+          <p>A summary. The full terms are set out in the proposal you sign.</p>
+          <ul>
+            <li>Scope is fixed in a signed proposal. Two design revision rounds are included; anything outside scope is quoted in writing first.</li>
+            <li>Projects under R30,000: 50% deposit, 50% before launch. R30,000 and up: 40% deposit, 30% at staging sign-off, 30% before launch.</li>
+            <li>Invoices are due within 7 days. Care and hosting plans are billed monthly in advance, or annually upfront.</li>
+            <li>Monthly plans can be cancelled with 30 days&rsquo; written notice.</li>
+            <li>You own your content, data, domain and brand assets. CulChar keeps its reusable platform code and grants you a licence to use it once paid in full.</li>
+            <li>When we part ways, we export your data and transfer your domain to you within 14 days of your request.</li>
+          </ul>
+        </section>
+
+        <section id="paia">
+          <h3>PAIA</h3>
+          <p>To request access to a record under the Promotion of Access to Information Act (PAIA), email <a href="mailto:muzi.mlimi@gmail.com">muzi.mlimi@gmail.com</a> with the subject &ldquo;PAIA request&rdquo;. Guidance on PAIA is available from the <a href="https://inforegulator.org.za" target="_blank" rel="noopener">Information Regulator</a>.</p>
+          <p class="updated">Last updated: November 2026</p>
+        </section>
+      </div>
     </div>
 
     <!-- Packages view -->
@@ -506,15 +636,28 @@ body.panel-open .view.active > *:nth-child(n+5){animation-delay:1s}
         <input type="hidden" name="_captcha" value="false">
         <input type="text" name="_honey" tabindex="-1" autocomplete="off" style="display:none">
 
-        <div class="field">
-          <label for="f-name">Name</label>
-          <input id="f-name" name="name" type="text" autocomplete="name" required>
-          <p class="err">Please enter your name.</p>
+        <div class="row">
+          <div class="field">
+            <label for="f-name">Name</label>
+            <input id="f-name" name="name" type="text" autocomplete="name" required>
+            <p class="err">Please enter your name.</p>
+          </div>
+          <div class="field">
+            <label for="f-email">Email</label>
+            <input id="f-email" name="email" type="email" autocomplete="email" required>
+            <p class="err">Please enter a valid email address.</p>
+          </div>
         </div>
-        <div class="field">
-          <label for="f-email">Email</label>
-          <input id="f-email" name="email" type="email" autocomplete="email" required>
-          <p class="err">Please enter a valid email address.</p>
+        <div class="row">
+          <div class="field">
+            <label for="f-phone">Phone <span class="opt">(optional)</span></label>
+            <input id="f-phone" name="phone" type="tel" autocomplete="tel" inputmode="tel">
+            <p class="err">Please enter a valid phone number.</p>
+          </div>
+          <div class="field">
+            <label for="f-business">Business name <span class="opt">(optional)</span></label>
+            <input id="f-business" name="business" type="text" autocomplete="organization">
+          </div>
         </div>
         <div class="field">
           <label for="f-package">Package</label>
@@ -527,11 +670,39 @@ body.panel-open .view.active > *:nth-child(n+5){animation-delay:1s}
             <option>Something custom</option>
           </select>
         </div>
+        <div class="row">
+          <div class="field">
+            <label for="f-budget">Budget range</label>
+            <select id="f-budget" name="budget">
+              <option>Not sure yet</option>
+              <option>Under R10,000</option>
+              <option>R10,000 &ndash; R30,000</option>
+              <option>R30,000 &ndash; R80,000</option>
+              <option>R80,000 &ndash; R150,000</option>
+              <option>Over R150,000</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="f-timeframe">Timeframe</label>
+            <select id="f-timeframe" name="timeframe">
+              <option>Just exploring</option>
+              <option>As soon as possible</option>
+              <option>Within a month</option>
+              <option>In 1&ndash;3 months</option>
+              <option>In 3+ months</option>
+            </select>
+          </div>
+        </div>
         <div class="field">
-          <label for="f-message">Message</label>
+          <label for="f-message">Tell us about your project</label>
           <textarea id="f-message" name="message" required></textarea>
           <p class="err">Please tell us a little about your project.</p>
         </div>
+        <label class="consent" id="consentWrap">
+          <input id="f-consent" name="consent" type="checkbox" value="Agreed to privacy notice" required>
+          <span>I agree that CulChar may use these details to respond to my enquiry, as set out in the <button type="button" data-open="legal">privacy notice</button>.</span>
+          <span class="err">Please tick the box so we can reply to you.</span>
+        </label>
         <button class="submit" type="submit" id="submitBtn">
           <span>Send</span>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
@@ -684,8 +855,11 @@ body.panel-open .view.active > *:nth-child(n+5){animation-delay:1s}
   const rules = {
     'f-name': v => v.length > 0,
     'f-email': v => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v),
-    'f-message': v => v.length > 0
+    'f-message': v => v.length > 0,
+    'f-phone': v => v === '' || /^[+()\d\s-]{9,20}$/.test(v)
   };
+  const consent = $('#f-consent'), consentWrap = $('#consentWrap');
+  consent.addEventListener('change', () => consentWrap.classList.remove('invalid'));
   Object.keys(rules).forEach(id => $('#' + id).addEventListener('input', e => e.target.closest('.field').classList.remove('invalid')));
 
   form.addEventListener('submit', async e => {
@@ -697,6 +871,8 @@ body.panel-open .view.active > *:nth-child(n+5){animation-delay:1s}
       el.setAttribute('aria-invalid', String(!ok));
       if (!ok && !first) first = el;
     }
+    consentWrap.classList.toggle('invalid', !consent.checked);
+    if (!consent.checked && !first) first = consent;
     if (first) { first.focus(); return; }
 
     const label = btn.querySelector('span');
