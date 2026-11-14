@@ -1,0 +1,325 @@
+/* =====================================================================
+   PUBLIC BOOKING WIZARD — inline block extracted from index.html
+   Was the <style> at index.html:41-115. Content is verbatim.
+
+   LOAD ORDER — this must remain the LAST project stylesheet on index.html.
+   It was an inline block after every <link>, so it won the cascade on ties;
+   the <link> replacing it sits in that same final position. Moving it above
+   css/public/redesign.css would let the redesign's booking rules override it.
+
+   Runtime-set styles are NOT here by design (§10): the booking wizard's
+   widths, progress values and dynamic colours are written by js/myscript.js
+   as inline styles and must stay there.
+   ===================================================================== */
+
+/* Dynamic Pricing Premium Styling */
+.bk-sticky-total {
+	position: sticky;
+	bottom: 0;
+	background: linear-gradient(135deg, #1a1a1a 0%, #0d0d0d 100%);
+	border-top: 1px solid rgba(212, 175, 55, 0.3);
+	padding: 15px 20px;
+	margin: 20px -20px -20px -20px;
+	z-index: 10;
+	display: flex;
+	justify-content: flex-end;
+	box-shadow: 0 -10px 20px rgba(0,0,0,0.5);
+	border-bottom-left-radius: 8px;
+	border-bottom-right-radius: 8px;
+}
+.bk-sticky-total-info {
+	text-align: right;
+}
+.bk-sticky-total-info p {
+	margin: 0;
+	font-size: 11px;
+	color: #888;
+	text-transform: uppercase;
+	letter-spacing: 1px;
+}
+.bk-sticky-total-info .amount {
+	display: block;
+	font-size: 24px;
+	font-weight: 800;
+	color: #D4AF37;
+	margin: 2px 0;
+	text-shadow: 0 2px 4px rgba(0,0,0,0.3);
+}
+.bk-sticky-total-note {
+	font-size: 9px;
+	color: #555;
+	max-width: 250px;
+	line-height: 1.3;
+}
+
+.bk-dur-hint {
+	animation: fadeInSlideUp 0.3s ease-out;
+}
+
+@keyframes fadeInSlideUp {
+	from { opacity: 0; transform: translateY(5px); }
+	to { opacity: 1; transform: translateY(0); }
+}
+
+#bkServicesTable tr {
+	transition: all 0.3s ease;
+}
+#bkServicesTable tr:hover {
+	background: rgba(255,255,255,0.02);
+}
+
+.book-review-row {
+	border-bottom: 1px solid rgba(255,255,255,0.05) !important;
+	padding: 12px 0 !important;
+}
+.book-review-row span:first-child {
+	color: #888 !important;
+	font-weight: 500 !important;
+	text-transform: uppercase !important;
+	font-size: 11px !important;
+	letter-spacing: 0.5px !important;
+}
+.book-review-row span:last-child {
+	color: #eee !important;
+	font-weight: 600 !important;
+}
+
+/* =====================================================================
+   PUBLIC BOOKING WIZARD — rules moved here from css/admin/redesign-admin.css
+   The CSS split cut the old monolithic redesign.css by LINE NUMBER, and these three blocks
+   (used only by the public booking drawer: the custom venue-search dropdown, the performance
+   time-slot grid, and the mobile attachment zone) landed in the admin half — which index.html
+   never loads. The drawer's slot times therefore rendered as a bare unstyled list and the venue
+   suggestions were unstyled. Moved verbatim; nothing else uses these classes.
+   ===================================================================== */
+
+/* ---------- CUSTOM VENUE AUTOCOMPLETE DROPDOWN ---------- */
+.venue-dropdown {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    z-index: 9999;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-default);
+    border-radius: 0 0 var(--r-md) var(--r-md);
+    box-shadow: var(--sh-lg);
+    max-height: 260px;
+    overflow-y: auto;
+    margin-top: 2px;
+}
+.vdd-item {
+    display: flex;
+    flex-direction: column;
+    padding: 10px 14px;
+    cursor: pointer;
+    border-top: 1px solid var(--border-low);
+    transition: background var(--t);
+}
+.vdd-item:first-child { border-top: none; }
+.vdd-item:hover,
+.vdd-item.vdd-active {
+    background: var(--bg-elevated);
+}
+.vdd-main {
+    color: var(--text-primary);
+    font-size: 13px;
+    font-weight: 500;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.vdd-sec {
+    color: var(--text-muted);
+    font-size: 11px;
+    margin-top: 2px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* ---------- VISUAL TIME PICKER ----------
+   Built by renderTimeSlots() in js/myscript.js: start times grouped Morning / Afternoon / Evening,
+   each chip a real <button> showing "start" over "to end" (or WHY it is unavailable). */
+.bk-time-slots-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  margin-top: 15px;
+}
+.bk-slot-group__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.bk-slot-group__title {
+  font-family: var(--f-body);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--text-primary);
+}
+.bk-slot-group__count { font-size: 11px; color: var(--text-secondary); }   /* --text-muted measured 3.5:1 here */
+.bk-slot-group__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+  gap: 8px;
+}
+
+.bk-time-slot {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  min-height: 52px;                 /* comfortable touch target */
+  padding: 8px 10px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  color: var(--text-primary);
+  border-radius: var(--r);
+  cursor: pointer;
+  font-family: var(--f-body);
+  line-height: 1.15;
+  transition: background .2s var(--ease), border-color .2s var(--ease), color .2s var(--ease);
+}
+.bk-time-slot__start {
+  font-size: .95rem;
+  font-weight: 600;
+  letter-spacing: .02em;
+  font-variant-numeric: tabular-nums;
+}
+.bk-time-slot__end {
+  font-size: 10px;
+  letter-spacing: .04em;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+/* Hover must not undo the selected state (it used to out-rank it). */
+.bk-time-slot:hover:not(.busy):not(.selected) {
+  background: var(--y-muted);
+  border-color: var(--y-base);
+  color: var(--y-hover);
+}
+.bk-time-slot:hover:not(.busy):not(.selected) .bk-time-slot__end { color: var(--y-hover); }
+.bk-time-slot:focus-visible { outline: 2px solid var(--y-hover); outline-offset: 2px; }
+.bk-time-slot.selected {
+  background: var(--y-base);
+  border-color: var(--y-base);
+  color: var(--text-inverse);
+}
+.bk-time-slot.selected .bk-time-slot__end { color: var(--text-inverse); opacity: .75; }
+.bk-time-slot.busy {
+  background: #151515;
+  border-color: #2e2e2e;
+  color: #a0a0a0;                   /* keeps AA contrast on the dark chip */
+  cursor: not-allowed;
+}
+.bk-time-slot.busy .bk-time-slot__start { text-decoration: line-through; }
+.bk-time-slot.busy .bk-time-slot__end {
+  color: #8f8f8f;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+}
+.bk-time-slot--allday {
+  flex-direction: row;
+  width: 100%;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 12px;
+  background: rgba(212, 175, 55, .1);
+  border-color: var(--y-base);
+  color: var(--y-base);
+}
+.bk-time-slot--allday.selected { background: var(--y-base); color: var(--text-inverse); }
+
+.bk-slot-msg {
+  padding: 12px 14px;
+  border: 1px dashed var(--border-default);
+  border-radius: var(--r);
+  color: var(--text-secondary);
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+}
+.bk-slot-msg--warn { border-color: rgba(var(--status-reserved-rgb), .55); color: var(--status-reserved); }
+.bk-slot-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.bk-slot-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-right: 6px;
+  vertical-align: -1px;
+  border-radius: 2px;
+  border: 1px solid var(--border-default);
+}
+.bk-slot-dot--free { background: var(--bg-surface); }
+.bk-slot-dot--sel  { background: var(--y-base); border-color: var(--y-base); }
+.bk-slot-dot--busy { background: #151515; border-color: #2e2e2e; }
+@media (max-width: 480px) {
+  .bk-slot-group__grid { grid-template-columns: repeat(3, 1fr); }
+}
+
+/* Mobile responsive file uploader styles */
+@media (max-width: 768px) {
+  #bookAttachZone {
+    padding: 12px 15px !important;
+    border-style: solid !important;
+    border-width: 1px !important;
+  }
+  .bk-attach-icon {
+    display: none !important;
+  }
+  .bk-attach-text-desktop {
+    display: none !important;
+  }
+  .bk-attach-text-mobile {
+    display: block !important;
+  }
+}
+
+/* Comfortable touch size on phones for two controls that measured under 44px (39px / 36px). */
+@media (max-width: 575px) {
+  #bookingDrawer .bk-svc-add,
+  #bookingDrawer .bk-dur-select,
+  #bookingDrawer .btn-bk-nav { min-height: 44px; }
+}
+
+/* ---------- VENUE SEARCH FEEDBACK + REQUIRED MARKER ---------- */
+/* Status under the venue field (searching / no results / unavailable) and the address that came from the
+   chosen place — see initAutocomplete() / venueChoose() in js/myscript.js. */
+.bk-venue-status {
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+.bk-venue-status--muted { color: var(--text-muted); }
+.bk-venue-status--warn  { color: var(--status-reserved); }
+.bk-venue-selected {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 8px 12px;
+  border: 1px solid rgba(var(--status-available-rgb), .4);
+  background: rgba(var(--status-available-rgb), .07);
+  border-radius: var(--r);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-primary);
+}
+.bk-venue-selected i { color: var(--status-available); margin-top: 3px; }
+/* When the suggestions open near the bottom, scrollIntoView keeps them clear of the sticky footer bar. */
+.venue-dropdown { scroll-margin-bottom: 96px; }
+/* The red asterisk on required labels had no rule of its own. */
+.bk-required { color: var(--status-blocked); margin-left: 2px; }

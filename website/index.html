@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CulChar — The Code We Live By</title>
+<meta name="description" content="CulChar builds websites around your culture — from simple business sites to booking, invoicing and ticketing platforms. Based in South Africa.">
+<meta property="og:type" content="website">
+<meta property="og:title" content="CulChar — The Code We Live By">
+<meta property="og:description" content="Websites built around your culture.">
+<meta property="og:image" content="assets/images/og-image.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="assets/images/og-image.jpg">
+<meta name="theme-color" content="#0b0b0b">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='4' fill='%231a1a1a'/><circle cx='16' cy='16' r='5' fill='%23d4473a'/></svg>">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data:; connect-src https://formsubmit.co; form-action 'self'; base-uri 'none'; object-src 'none'; upgrade-insecure-requests">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<link rel="preload" href="assets/fonts/bebas-neue-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="assets/fonts/dm-sans-latin-700-normal.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="assets/css/site.css">
+</head>
+<body>
+
+<div class="loader-bar" id="loaderBar"></div>
+<div class="loader" aria-hidden="true"><span>CUL<b>.</b>CHAR</span></div>
+
+<div class="stage" id="stage">
+
+  <!-- ================= INTRO SCREEN ================= -->
+  <main class="screen" id="intro">
+    <div class="bg layer" data-depth="0.02" aria-hidden="true">
+      <div class="slide slide-1 active"><div class="slide-inner"></div></div>
+      <div class="slide slide-2"><div class="slide-inner"></div></div>
+      <div class="slide slide-3"><div class="slide-inner"></div></div>
+    </div>
+    <div class="overlay" aria-hidden="true"></div>
+    <div class="pattern" aria-hidden="true"></div>
+    <canvas id="particles" class="layer" data-depth="0.06" aria-hidden="true"></canvas>
+
+    <div class="intro">
+      <div class="layer" data-depth="0.12">
+        <h1 class="logo">CUL<span class="dot">.</span>CHAR</h1>
+        <p class="logo-sub"><span>The code we live by.</span><span>Estd. 2026</span></p>
+      </div>
+
+      <div class="headlines layer" data-depth="0.08" aria-live="polite">
+        <h2 class="headline active"><span>Websites built around <em>your</em> culture.</span></h2>
+        <h2 class="headline"><span>Software that adapts to <em>your</em> culture.</span></h2>
+        <h2 class="headline"><span>A cohesive team. Modern techniques.</span></h2>
+        <h2 class="headline"><span>Fundamentals first. Clean code.</span></h2>
+        <h2 class="headline"><span>Booking, quotes, invoices &amp; tickets.</span></h2>
+      </div>
+
+      <p class="contact-line">
+        Drop us an email&nbsp; <a href="mailto:muzi.mlimi@gmail.com">muzi.mlimi@gmail.com</a>
+      </p>
+
+      <div class="actions">
+        <button class="btn-wrap" data-open="contact" aria-label="Let&rsquo;s talk: open the contact form">
+          <span class="btn-square solid"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M2 5h20v14H2V5zm2 2v.5l8 5 8-5V7H4zm16 2.8-8 5-8-5V17h16V9.8z"/></svg></span>
+          <span class="btn-label">Let&rsquo;s talk</span>
+        </button>
+      </div>
+      <nav class="menu" aria-label="Sections">
+        <button data-open="about">About</button>
+        <button data-open="services">Services</button>
+        <button data-open="approach">Approach</button>
+        <button data-open="work">Work</button>
+        <button data-open="packages">Packages</button>
+      </nav>
+    </div>
+
+    <p class="footnote">&copy; <span class="year"></span> CulChar (pronounced &ldquo;Culture&rdquo;) &middot; South Africa &middot; <button data-open="legal">Privacy</button> <button data-open="legal">Terms</button> <button data-open="legal">PAIA</button></p>
+  </main>
+
+  <!-- ================= SLIDE-UP PANEL ================= -->
+  <section class="panel" id="panel" aria-label="More information" inert>
+    <button class="panel-close" id="panelClose" aria-label="Back to the intro screen">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+    </button>
+
+    <nav class="tabs" aria-label="Panel sections">
+      <button data-open="about">About</button>
+      <button data-open="services">Services</button>
+      <button data-open="approach">Approach</button>
+      <button data-open="work">Work</button>
+      <button data-open="why">Why us</button>
+      <button data-open="packages">Packages</button>
+      <button data-open="contact">Contact</button>
+    </nav>
+
+    <!-- About view -->    <div class="view" id="view-about">
+      <h2 class="view-title">More than a name. It&rsquo;s how we <em>build</em>.</h2>
+      <p class="view-intro">CulChar was born from a simple belief: great software doesn&rsquo;t just solve problems &mdash; it reflects the people and values behind the business it serves.</p>
+      <p class="pronounce">/&#712;k&#652;l.t&#643;&#601;r/ &mdash; pronounced &ldquo;Culture&rdquo;</p>
+      <div class="cards">
+        <article class="card accent">
+          <h3>CUL &mdash; Culture</h3>
+          <p>Understanding your business ethos. We take the time to learn how your organisation thinks, operates and connects with its audience &mdash; then build software that fits.</p>
+        </article>
+        <article class="card accent">
+          <h3>CHAR &mdash; The variable</h3>
+          <p>In programming, <em>char</em> is a fundamental variable type &mdash; the building block of every string, every message, every interaction. It stands for our focus on getting the foundations right.</p>
+        </article>
+      </div>
+      <div class="prose">
+        <p>Our name is a deliberate fusion. &ldquo;Culture&rdquo; speaks to our dual commitment: understanding the unique ethos of every client&rsquo;s business, and nurturing a cohesive, close-knit team culture of our own.</p>
+        <p>&ldquo;Char&rdquo; is a nod to the fundamentals of programming. Just as the <em>char</em> is the smallest meaningful unit in code, we believe exceptional software is built from meticulous attention to the details that matter most.</p>
+        <p>We work with shared values and modern development techniques, committed to delivering work we&rsquo;re proud to stand behind.</p>
+      </div>
+      <pre class="code" aria-hidden="true"><b>const</b> culture = {
+  team: 'cohesive',
+  approach: 'modern',
+  focus: 'fundamentals'
+};
+
+<b>function</b> build(client) {
+  <b>return</b> adapt(client.culture, culture);
+}</pre>
+    </div>
+
+    <div class="view" id="view-services">
+      <h2 class="view-title">Software crafted with culture in <em>mind</em>.</h2>
+      <p class="view-intro">Built with precision at its core.</p>
+      <div class="cards single">
+        <article class="card">
+          <div class="ico" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/><line x1="14" y1="4" x2="10" y2="20"/></svg></div>
+          <h3>Website development</h3>
+          <p>From single-page marketing sites to complex web applications, we design and develop digital experiences that embody your brand&rsquo;s character. Every interaction is intentional, every line of code purposeful.</p>
+          <div class="tags"><span>React</span><span>Next.js</span><span>Node.js</span><span>Responsive</span><span>E-commerce</span><span>CMS</span></div>
+        </article>
+      </div>
+      <p class="prose">Websites come as clear, fixed-price packages, and extra features can be added as you grow. Not sure which fits? Tell us what you have in mind.</p>
+      <div class="cta-row">
+        <button class="submit" data-open="packages">See website packages</button>
+        <button class="submit" data-open="contact">Let&rsquo;s talk</button>
+      </div>
+    </div>
+
+    <div class="view" id="view-approach">
+      <h2 class="view-title">Software that adapts to <em>your</em> culture.</h2>
+      <p class="view-intro">We don&rsquo;t believe in one-size-fits-all. Every project begins with understanding &mdash; your business, your audience, your values &mdash; then we build software that feels like a natural extension of who you are.</p>
+      <div class="pillars">
+        <div class="pillar"><span class="n">01</span><div><h4>Culture-first discovery</h4><p>Before we write a single line of code, we learn how your business thinks. Your culture is the brief &mdash; the technology follows.</p></div></div>
+        <div class="pillar"><span class="n">02</span><div><h4>A cohesive team, not a marketplace</h4><p>We stay close, share context and own each project together, so you deal with a team that knows your work.</p></div></div>
+        <div class="pillar"><span class="n">03</span><div><h4>Modern techniques, clean code</h4><p>We use current frameworks and practices &mdash; not for novelty, but for performance, maintainability and long-term value.</p></div></div>
+        <div class="pillar"><span class="n">04</span><div><h4>Fundamentals first</h4><p>Like the <em>char</em> in our name, we obsess over the building blocks. Strong foundations make software that scales gracefully and ages well.</p></div></div>
+      </div>
+      <p class="quote">&ldquo;The code we live by&rdquo; isn&rsquo;t just a tagline. It&rsquo;s our <em>technical standard</em> and our <em>values system</em>, inseparable by design.</p>
+      <div>
+        <h3 class="process-title">How a project runs</h3>
+        <p class="process-sub">Six steps, with your sign-off before each big move.</p>
+        <ol class="steps">
+          <li><h4>Discovery</h4><p>A requirements session, then a sitemap, feature list and written scope.</p></li>
+          <li><h4>Proposal</h4><p>Fixed scope and price in a signed proposal. A deposit starts the work.</p></li>
+          <li><h4>Design</h4><p>Your brand applied to CulChar layouts, with two rounds of revisions.</p></li>
+          <li><h4>Build</h4><p>Development on a private staging link so you can see progress and sign it off.</p></li>
+          <li><h4>Test &amp; launch</h4><p>Functional, mobile and browser testing, then domain, SSL and go-live.</p></li>
+          <li><h4>Handover &amp; care</h4><p>A training session and admin guide, then a care plan keeps it secure.</p></li>
+        </ol>
+      </div>
+    </div>
+
+    <div class="view" id="view-why">
+      <h2 class="view-title">Why <em>CulChar</em>.</h2>
+      <p class="view-intro">The things we won&rsquo;t compromise on.</p>
+      <div class="why">
+        <article class="card"><div class="ico" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg></div><h3>Culture-first</h3><p>Your business culture is our starting point, not an afterthought. We build software that feels native to your organisation.</p></article>
+        <article class="card"><div class="ico" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg></div><h3>Modern stack</h3><p>React, Next.js, Node &mdash; we choose the right tools for the job, always current, always performant.</p></article>
+        <article class="card"><div class="ico" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></div><h3>Dedicated team</h3><p>A cohesive group that shares context, standards and a genuine commitment to your success.</p></article>
+        <article class="card"><div class="ico" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg></div><h3>The char philosophy</h3><p>Attention to fundamentals. Clean code, solid architecture and careful craftsmanship at every level.</p></article>
+      </div>
+      <div class="cta-row"><button class="submit" data-open="contact">Let&rsquo;s talk</button></div>
+    </div>
+
+    <div class="view" id="view-work">
+      <h2 class="view-title">Selected <em>work</em>.</h2>
+      <p class="view-intro">Every build starts with the client&rsquo;s culture. Here&rsquo;s what that has looked like so far.</p>
+      <div class="work">
+        <article class="work-card">
+          <div class="work-visual" aria-hidden="true"><span>Editorial-luxe</span><small>Entertainer &middot; Website &amp; platform</small></div>
+          <div class="work-body">
+            <p class="kicker">Website &amp; business platform</p>
+            <h3>Thabiso Mhlongo</h3>
+            <p>A website for a South African entertainer, designed in an editorial-luxe style, with the business system behind it: booking enquiries, a client CRM, PDF quotes with online acceptance, invoicing and payments, and events with online ticketing.</p>
+            <div class="tags work-tags"><span>Website</span><span>Booking &amp; CRM</span><span>Quotes &amp; invoicing</span><span>PayFast</span><span>Ticketing</span><span>Admin portal</span></div>
+          </div>
+        </article>
+        <article class="work-card next">
+          <h3>Your project next</h3>
+          <p>Tell us about your business and what you need. We&rsquo;ll come back with a scope and a fixed price.</p>
+          <button class="submit" data-open="contact">Start a project</button>
+        </article>
+      </div>
+    </div>
+
+    <div class="view" id="view-legal">
+      <h2 class="view-title">Privacy &amp; <em>terms</em>.</h2>
+      <p class="view-intro">How we handle your information, and the terms that apply to this website and our work.</p>
+      <div class="legal">
+        <section id="privacy">
+          <h3>Privacy notice</h3>
+          <p>CulChar is a website design and development business in South Africa. This notice explains what personal information this website collects and how we use it, in line with the Protection of Personal Information Act (POPIA).</p>
+          <h4>What we collect</h4>
+          <p>Only what you send us through the contact form: your name and email address, and, if you choose to give them, your phone number, business name, the package you&rsquo;re interested in, your budget range, your timeframe and your message. This site does not use analytics, advertising or tracking cookies.</p>
+          <h4>Why we use it</h4>
+          <p>To reply to your enquiry, discuss your project and prepare a proposal. We don&rsquo;t sell your information or use it for marketing without your consent.</p>
+          <h4>Who else handles it</h4>
+          <ul>
+            <li><strong>FormSubmit</strong> (formsubmit.co) receives the contact form and forwards it to us by email.</li>
+          </ul>
+          <p>This service may process information outside South Africa. The fonts and everything else on this page are served from our own site.</p>
+          <h4>How long we keep it</h4>
+          <p>Only as long as we need it to respond to you and follow up. If your enquiry becomes a project, your details become part of the client record covered by your agreement with us.</p>
+          <h4>Your rights</h4>
+          <p>You can ask us what information we hold about you, and ask us to correct or delete it, by emailing <a href="mailto:muzi.mlimi@gmail.com">muzi.mlimi@gmail.com</a>. If you&rsquo;re unhappy with how we&rsquo;ve handled your information, you can complain to the <a href="https://inforegulator.org.za" target="_blank" rel="noopener">Information Regulator</a>.</p>
+          <h4>Information officer</h4>
+          <p>The owner of CulChar, reachable at <a href="mailto:muzi.mlimi@gmail.com">muzi.mlimi@gmail.com</a>.</p>
+        </section>
+
+        <section id="terms">
+          <h3>Terms</h3>
+          <h4>Using this website</h4>
+          <p>The information on this website is general. Prices are in South African rand and may change; CulChar is not VAT-registered, so no VAT is charged. A price becomes binding only in a signed proposal. The content and design of this site belong to CulChar.</p>
+          <h4>How we work with clients</h4>
+          <p>A summary. The full terms are set out in the proposal you sign.</p>
+          <ul>
+            <li>Scope is fixed in a signed proposal. Two design revision rounds are included; anything outside scope is quoted in writing first.</li>
+            <li>Projects under R30,000: 50% deposit, 50% before launch. R30,000 and up: 40% deposit, 30% at staging sign-off, 30% before launch.</li>
+            <li>Invoices are due within 7 days. Care and hosting plans are billed monthly in advance, or annually upfront.</li>
+            <li>Monthly plans can be cancelled with 30 days&rsquo; written notice.</li>
+            <li>You own your content, data, domain and brand assets. CulChar keeps its reusable platform code and grants you a licence to use it once paid in full.</li>
+            <li>When we part ways, we export your data and transfer your domain to you within 14 days of your request.</li>
+          </ul>
+        </section>
+
+        <section id="paia">
+          <h3>PAIA</h3>
+          <p>To request access to a record under the Promotion of Access to Information Act (PAIA), email <a href="mailto:muzi.mlimi@gmail.com">muzi.mlimi@gmail.com</a> with the subject &ldquo;PAIA request&rdquo;. Guidance on PAIA is available from the <a href="https://inforegulator.org.za" target="_blank" rel="noopener">Information Regulator</a>.</p>
+          <p class="updated">Last updated: November 2026</p>
+        </section>
+      </div>
+    </div>
+
+    <!-- Packages view -->
+    <div class="view" id="view-packages">
+      <h2 class="view-title">Pick your <em>package</em>.</h2>
+      <p class="view-intro">Every build starts from the CulChar design system and is shaped around your brand. Once-off build fee, then a monthly care and hosting plan that keeps it secure and running.</p>
+
+      <div class="packages">
+        <article class="pkg">
+          <h3>Starter</h3>
+          <p class="for">Sole traders, freelancers and startups that need a professional presence.</p>
+          <p class="price"><small>Once-off</small>R9,500</p>
+          <p class="monthly">then from <b>R900</b>/month</p>
+          <ul>
+            <li>Up to 5 pages</li>
+            <li>Contact form to email with spam protection</li>
+            <li>SEO foundation, mobile-ready</li>
+            <li>Domain, SSL &amp; Cloudflare setup</li>
+            <li>Testing and a 1-hour handover</li>
+          </ul>
+          <p class="meta"><span>Delivery</span><span>1–2 weeks</span></p>
+          <button class="pkg-cta" data-package="Starter">Start with Starter</button>
+        </article>
+
+        <article class="pkg">
+          <h3>Business</h3>
+          <p class="for">Established SMEs that want to update their own site and manage enquiries.</p>
+          <p class="price"><small>Once-off</small>R26,500</p>
+          <p class="monthly">then from <b>R900</b>/month</p>
+          <ul>
+            <li>Everything in Starter, up to 8 pages</li>
+            <li>Admin portal with user roles</li>
+            <li>Editable homepage, gallery, testimonials, FAQ</li>
+            <li>Enquiry inbox &amp; branded emails</li>
+            <li>Backups &amp; Cloudflare analytics</li>
+          </ul>
+          <p class="meta"><span>Delivery</span><span>3–4 weeks</span></p>
+          <button class="pkg-cta" data-package="Business">Choose Business</button>
+        </article>
+
+        <article class="pkg featured">
+          <span class="tag">Recommended</span>
+          <h3>Professional</h3>
+          <p class="for">Service businesses that take bookings and send quotes and invoices.</p>
+          <p class="price"><small>Once-off</small>R74,500</p>
+          <p class="monthly">then from <b>R2,600</b>/month</p>
+          <ul>
+            <li>Everything in Business</li>
+            <li>Booking wizard, pipeline &amp; client CRM</li>
+            <li>Availability &amp; double-booking guard</li>
+            <li>PDF quotes with online acceptance</li>
+            <li>Invoicing, EFT &amp; proof of payment</li>
+            <li>Insights dashboard</li>
+          </ul>
+          <p class="meta"><span>Delivery</span><span>6–8 weeks</span></p>
+          <button class="pkg-cta" data-package="Professional">Choose Professional</button>
+        </article>
+
+        <article class="pkg">
+          <h3>Platform</h3>
+          <p class="for">Businesses running their whole operation online. Quoted from this price.</p>
+          <p class="price"><small>From</small>R145,000</p>
+          <p class="monthly">then from <b>R4,900</b>/month</p>
+          <ul>
+            <li>Everything in Professional</li>
+            <li>Contracts, PayFast &amp; payment plans</li>
+            <li>Finance dashboard &amp; refunds</li>
+            <li>Automated follow-ups &amp; newsletter</li>
+            <li>Google Calendar sync &amp; analytics</li>
+            <li>POPIA toolkit</li>
+          </ul>
+          <p class="meta"><span>Delivery</span><span>10–14 weeks</span></p>
+          <button class="pkg-cta" data-package="Platform">Talk about Platform</button>
+        </article>
+      </div>
+
+      <h3 class="plans-title">Care &amp; hosting</h3>
+      <p class="plans-sub">“From” monthly prices above combine the minimum care plan with hosting. Pay annually and save.</p>
+      <div class="plans">
+        <div class="plan">
+          <h4>Care Basic <span>R650/mo</span></h4>
+          <p>Uptime monitoring, weekly off-site backup, monthly security updates, email support and up to 45 minutes of small changes.</p>
+          <p class="resp">Response within 2 business days</p>
+        </div>
+        <div class="plan">
+          <h4>Care Plus <span>R1,650/mo</span></h4>
+          <p>Everything in Basic plus daily backups, payment and email monitoring, a monthly health report, priority queue and 2 hours of changes.</p>
+          <p class="resp">Response within 1 business day</p>
+        </div>
+        <div class="plan">
+          <h4>Care Premium <span>R3,950/mo</span></h4>
+          <p>Everything in Plus plus quarterly restore tests, database health checks, a WhatsApp support line, quarterly review call and 5 hours of changes.</p>
+          <p class="resp">Critical issues within 4 business hours</p>
+        </div>
+      </div>
+      <div class="hosting">
+        <div class="plan">
+          <h4>Website hosting <span>R250/mo</span></h4>
+          <p>Managed server space, SSL, Cloudflare and uptime checks for Starter and Business sites.</p>
+        </div>
+        <div class="plan">
+          <h4>Application hosting <span>R950/mo</span></h4>
+          <p>Dedicated server for booking and payment apps, media storage, scheduled-job monitoring and off-site backups.</p>
+        </div>
+      </div>
+
+      <p class="small-print">Prices are in South African rand. CulChar is not VAT-registered, so no VAT is charged. Domains, mailboxes and payment-gateway fees are billed by the provider directly. Need something not listed? Individual features and redesigns are quoted on request — <a href="#" data-open="contact">get in touch</a>.</p>
+    </div>
+
+    <!-- Contact view -->
+    <div class="view" id="view-contact">
+      <h2 class="view-title">Contact</h2>
+      <p class="view-intro">Want to say hello? Got a project in mind? Tell us about it and we'll get back to you as soon as we can.</p>
+
+      <form class="form" id="contactForm" novalidate>
+        <input type="hidden" name="_subject" value="New enquiry from the CulChar website">
+        <input type="hidden" name="_template" value="table">
+        <input type="hidden" name="_captcha" value="false">
+        <input type="text" name="_honey" class="hp" tabindex="-1" autocomplete="off" aria-hidden="true">
+
+        <div class="row">
+          <div class="field">
+            <label for="f-name">Name</label>
+            <input id="f-name" name="name" type="text" autocomplete="name" required>
+            <p class="err">Please enter your name.</p>
+          </div>
+          <div class="field">
+            <label for="f-email">Email</label>
+            <input id="f-email" name="email" type="email" autocomplete="email" required>
+            <p class="err">Please enter a valid email address.</p>
+          </div>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label for="f-phone">Phone <span class="opt">(optional)</span></label>
+            <input id="f-phone" name="phone" type="tel" autocomplete="tel" inputmode="tel">
+            <p class="err">Please enter a valid phone number.</p>
+          </div>
+          <div class="field">
+            <label for="f-business">Business name <span class="opt">(optional)</span></label>
+            <input id="f-business" name="business" type="text" autocomplete="organization">
+          </div>
+        </div>
+        <div class="field">
+          <label for="f-package">Package</label>
+          <select id="f-package" name="package">
+            <option value="Not sure yet">Not sure yet</option>
+            <option>Starter</option>
+            <option>Business</option>
+            <option>Professional</option>
+            <option>Platform</option>
+            <option>Something custom</option>
+          </select>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label for="f-budget">Budget range</label>
+            <select id="f-budget" name="budget">
+              <option>Not sure yet</option>
+              <option>Under R10,000</option>
+              <option>R10,000 &ndash; R30,000</option>
+              <option>R30,000 &ndash; R80,000</option>
+              <option>R80,000 &ndash; R150,000</option>
+              <option>Over R150,000</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="f-timeframe">Timeframe</label>
+            <select id="f-timeframe" name="timeframe">
+              <option>Just exploring</option>
+              <option>As soon as possible</option>
+              <option>Within a month</option>
+              <option>In 1&ndash;3 months</option>
+              <option>In 3+ months</option>
+            </select>
+          </div>
+        </div>
+        <div class="field">
+          <label for="f-message">Tell us about your project</label>
+          <textarea id="f-message" name="message" required></textarea>
+          <p class="err">Please tell us a little about your project.</p>
+        </div>
+        <label class="consent" id="consentWrap">
+          <input id="f-consent" name="consent" type="checkbox" value="Agreed to privacy notice" required>
+          <span>I agree that CulChar may use these details to respond to my enquiry, as set out in the <button type="button" data-open="legal">privacy notice</button>.</span>
+          <span class="err">Please tick the box so we can reply to you.</span>
+        </label>
+        <button class="submit" type="submit" id="submitBtn">
+          <span>Send</span>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+        </button>
+      </form>
+      <p class="alt-contact">Prefer email? <a href="mailto:muzi.mlimi@gmail.com">muzi.mlimi@gmail.com</a></p>
+    </div>
+  </section>
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script src="assets/js/site.js" defer></script>
+</body>
+</html>

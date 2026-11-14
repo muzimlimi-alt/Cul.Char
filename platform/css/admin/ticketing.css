@@ -1,0 +1,170 @@
+/* =====================================================================
+   ADMIN - EVENT TICKETING (docs-internal/ticketing.md)
+   The event drawer's Tickets tab and the Events -> Ticket Sales tab (js/admin/ticketing.js). Uses the platform tokens only (--atl-*)
+   and the existing atl-badge / atl-btn / um-* components; every selector here is new (.tkt-*), so load order does not matter.
+   ===================================================================== */
+
+/* assistants see the figures but not the controls (the server refuses them anyway) */
+body.role-assistant .tkt-manage { display: none !important; }
+
+.tkt-event { display: flex; flex-direction: column; gap: 12px; }
+.tkt-muted { color: var(--atl-muted); font-size: 13px; margin: 0; }
+.tkt-hint { color: var(--atl-muted); font-size: 11px; margin: 8px 0 0; line-height: 1.5; }
+.tkt-warn { margin: 0; border: 1px solid color-mix(in srgb, var(--atl-orange) 45%, transparent); background: color-mix(in srgb, var(--atl-orange) 10%, transparent); color: var(--atl-ink); border-radius: 6px; padding: 8px 12px; font-size: 12px; }
+.tkt-head { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; }
+.tkt-totals { margin-left: 10px; font-size: 12px; color: var(--atl-muted); font-variant-numeric: tabular-nums; }
+
+.tkt-tiers { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.tkt-tier { border: 1px solid var(--atl-line); border-radius: 6px; background: var(--atl-surface2); padding: 12px 14px; }
+.tkt-tier__top { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.tkt-tier__name { color: var(--atl-ink); font-size: 14px; }
+.tkt-price { font-family: 'JetBrains Mono', ui-monospace, monospace; font-variant-numeric: tabular-nums; color: var(--atl-amber); font-size: 13px; margin-right: auto; }
+.tkt-tier__sub { font-size: 12px; color: var(--atl-muted); margin-top: 4px; font-variant-numeric: tabular-nums; }
+.tkt-tier__actions { display: flex; gap: 8px; margin-top: 10px; }
+.tkt-tier__actions .atl-btn, .tkt-add .atl-btn { font-size: 12px; }
+
+.tkt-meter { display: flex; height: 8px; margin-top: 10px; border-radius: 999px; overflow: hidden; background: var(--atl-surface3); }
+.tkt-meter__sold { background: var(--atl-amber); }
+.tkt-meter__held { background: var(--atl-orange); opacity: .7; }
+
+.tkt-editor { margin-top: 12px; border-top: 1px dashed var(--atl-line); padding-top: 12px; }
+.tkt-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.tkt-grid label { display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: var(--atl-muted); text-transform: uppercase; letter-spacing: .06em; margin: 0; }
+.tkt-grid .tkt-wide { grid-column: 1 / -1; }
+.tkt-grid .tkt-check { flex-direction: row; align-items: center; gap: 8px; text-transform: none; letter-spacing: 0; font-size: 13px; color: var(--atl-ink); }
+.tkt-form-error { color: var(--atl-clay); font-size: 12px; margin: 6px 0 0; min-height: 1em; }
+.tkt-editor__actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
+@media (max-width: 520px) { .tkt-grid { grid-template-columns: 1fr; } }
+.tkt-view-orders { align-self: flex-start; font-size: 12px; }
+.tkt-notice p { margin: 0; }
+.tkt-linkbtn { background: none; border: 0; padding: 2px 4px; font: inherit; font-size: 12px; color: var(--atl-amber); text-decoration: underline; cursor: pointer; }
+.tkt-notice__row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; margin-top: 8px !important; font-weight: 600; }
+.tkt-notice__row .atl-btn { font-size: 12px; }
+
+/* ── Events -> Ticket Sales ── */
+#eventsAdmin.tkt-mode .evt-controls-row, #eventsAdmin.tkt-mode #evtBulkBar { display: none !important; }   /* those filter event cards, not orders */
+.tkt-sales { display: flex; flex-direction: column; gap: 16px; }
+.tkt-sales__bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.tkt-sales__label { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--atl-muted); margin: 0; }
+/* the shared .atl-input is width:100% - here the selects sit inline with their label / the search box */
+.tkt-sales .atl-input.tkt-select { width: auto !important; flex: 0 1 auto; min-width: 220px; max-width: 100%; font-size: 13px; }
+.tkt-sales__bar .atl-input.tkt-select { min-width: 320px; }
+#tktSalesBody:not([hidden]) { display: flex; flex-direction: column; gap: 16px; }
+.tkt-tier-table .table { margin-bottom: 0; }
+@media (max-width: 640px) { .tkt-sales .atl-input.tkt-select, .tkt-sales__bar .atl-input.tkt-select { width: 100% !important; min-width: 0; } .tkt-sales__links { margin-left: 0; } }
+.tkt-sales__links { display: flex; gap: 8px; flex-wrap: wrap; margin-left: auto; }
+.tkt-sales__links .atl-btn { font-size: 12px; }
+.tkt-stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
+.tkt-stat { cursor: default; }
+.tkt-stat .db-stat-value small { font-family: 'Outfit', sans-serif; font-size: 14px; color: var(--atl-muted); font-weight: 500; margin-left: 2px; }
+.tkt-stat__sub { display: block; font-size: 11px; color: var(--atl-muted); margin-top: 2px; }
+.tkt-table td, .tkt-table th { vertical-align: middle; }
+.tkt-table th { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--atl-muted); }
+.tkt-num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.tkt-col-bar { width: 28%; min-width: 120px; }
+.tkt-col-bar .tkt-meter { margin-top: 0; }
+.tkt-buyer { display: block; font-weight: 600; color: var(--atl-ink); }
+.tkt-sub { display: block; font-size: 11px; color: var(--atl-muted); }
+.tkt-empty { padding: 28px 12px !important; text-align: center; color: var(--atl-muted); font-size: 13px; }
+.tkt-order-row { cursor: pointer; }
+.tkt-orders-bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 10px; }
+.tkt-pager { display: flex; gap: 10px; align-items: center; justify-content: center; margin-top: 10px; }
+
+/* ── order drawer ── */
+.tkt-order { display: flex; flex-direction: column; gap: 14px; }
+.tkt-order__head { display: flex; justify-content: space-between; align-items: center; }
+.tkt-order__head .tkt-price { font-size: 16px; margin: 0; }
+.tkt-kv { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 14px; margin: 0; font-size: 13px; }
+.tkt-kv dt { color: var(--atl-muted); font-weight: 500; margin: 0; }
+.tkt-kv dd { color: var(--atl-ink); margin: 0; overflow-wrap: anywhere; }
+.tkt-mono { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 12px; }
+.tkt-h { margin: 6px 0 0; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--atl-muted); font-weight: 600; }
+.tkt-list { list-style: none; margin: 0; padding: 0; font-size: 13px; }
+.tkt-list li { padding: 7px 0; border-top: 1px solid var(--atl-line); color: var(--atl-ink); display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.tkt-list li:first-child { border-top: none; }
+.tkt-list .tkt-price { margin-left: auto; }
+.tkt-list--small li { font-size: 12px; color: var(--atl-muted); }
+.tkt-order__actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.tkt-danger { border-color: var(--atl-clay); color: var(--atl-clay); }
+.tkt-danger-solid { background: var(--atl-clay) !important; border-color: var(--atl-clay) !important; }
+.tkt-refund { border: 1px solid var(--atl-line); border-radius: 6px; padding: 12px; background: var(--atl-surface2); }
+.tkt-refund .tkt-check-line { display: flex; align-items: center; gap: 8px; margin: 10px 0 0; font-size: 13px; text-transform: none; letter-spacing: 0; color: var(--atl-ink); }
+.tkt-refund label:not(.tkt-check-line) { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--atl-muted); margin-bottom: 6px; }
+
+/* door links (Ticket Sales) */
+.tkt-doorpasses { display: flex; flex-direction: column; gap: 10px; margin: 16px 0; padding: 14px; border: 1px solid var(--atl-line); border-radius: 8px; }
+.tkt-doorpasses .um-section-label { margin: 0; }
+.tkt-doorpasses__form { display: flex; gap: 8px; flex-wrap: wrap; }
+.tkt-doorpasses__form .atl-input { flex: 1 1 220px; min-width: 0; }
+.tkt-doorpasses__list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.tkt-doorpass { display: flex; gap: 10px; align-items: center; justify-content: space-between; flex-wrap: wrap; padding: 8px 10px; border: 1px solid var(--atl-line); border-radius: 6px; }
+.tkt-doorpass--off { opacity: .65; }
+.tkt-doorpass__label { margin: 0; font-weight: 700; color: var(--atl-ink); }
+.tkt-doorpass .atl-btn { font-size: 12px; }
+.tkt-doorpass-new { border: 1px solid color-mix(in srgb, var(--atl-amber) 50%, transparent); background: color-mix(in srgb, var(--atl-amber) 8%, transparent); border-radius: 6px; padding: 12px; font-size: 13px; color: var(--atl-ink); }
+.tkt-doorpass-new p { margin: 0 0 10px; }
+.tkt-doorpass-new__row { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+.tkt-doorpass-new__qr { background: #fff; padding: 6px; border-radius: 6px; flex: 0 0 auto; }
+.tkt-doorpass-new__link { display: flex; flex-direction: column; gap: 6px; flex: 1 1 240px; min-width: 0; }
+.tkt-doorpass-new__link .atl-input { width: 100%; font-family: var(--f-mono, monospace); font-size: 12px; }
+
+/* text for screen readers only (e.g. a table column whose header would otherwise be empty) */
+.tkt-sr { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+
+/* guest list (complimentary tickets) */
+.tkt-comps__form { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px 12px; align-items: end; }
+.tkt-comps__field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.tkt-comps__field > span { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--atl-muted); }
+.tkt-comps__field--wide { grid-column: 1 / -1; }
+.tkt-comps .tkt-check-line { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--atl-ink); }
+.tkt-reissue-box { margin-top: 8px; }
+/* the Door links / Guest list headings are h3 (heading order) but look like the panel's other section labels */
+#evtPanelTickets .tkt-doorpasses h3.um-section-label { font-size: 16px !important; font-weight: 700 !important; line-height: 1.3 !important; letter-spacing: 0 !important; text-transform: none !important; margin: 0 !important; }   /* !important: the theme engine sizes every h3 */
+#evtPanelTickets .tkt-comps label.tkt-check-line { text-transform: none !important; letter-spacing: 0 !important; font-weight: 400 !important; font-size: 13px !important; margin: 0 !important; }
+
+/* ── Manage tickets drawer (#tktManageDrawer) and the event-card actions ── */
+#tktManageDrawerBody { display: flex; flex-direction: column; gap: 16px; }
+.tkt-evstrip { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: flex-start; justify-content: space-between; }
+.tkt-evstrip__title { margin: 0 0 2px; font-size: 18px; color: var(--atl-ink) !important; }
+.tkt-evstrip__links { display: flex; flex-wrap: wrap; gap: 8px; }
+.tkt-evstrip__links .atl-btn, .tkt-sales-btns .atl-btn { font-size: 12px; }
+.tkt-panel { border: 1px solid var(--atl-line); border-radius: 8px; padding: 14px; background: var(--atl-surface2); display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.tkt-panel__head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.tkt-panel__head .tkt-h { margin: 0; }
+.tkt-sales-btns { display: flex; flex-wrap: wrap; gap: 8px; }
+.tkt-holds i { color: var(--atl-orange); margin-right: 4px; }
+.tkt-window summary { cursor: pointer; font-size: 13px; color: var(--atl-ink); padding: 4px 0; }
+.tkt-window form { margin-top: 8px; }
+.tkt-stat-grid--sm { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+.tkt-stat-grid--sm .db-stat-card { padding: 12px; }
+.tkt-stat-grid--sm .db-stat-value { font-size: 20px; }
+.tkt-tablewrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.tkt-table--cats { min-width: 440px; margin-bottom: 0; }
+.tkt-table--cats tfoot th, .tkt-table--cats tfoot td { border-top: 2px solid var(--atl-line); font-weight: 700; }
+.tkt-table--cats tbody th { font-weight: 600; color: var(--atl-ink); text-transform: none; letter-spacing: 0; font-size: 13px; }
+.tkt-cap { margin-top: 10px; }
+.tkt-cap__label { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--atl-muted); margin: 0 0 6px; }
+.tkt-cap__ctl { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.tkt-cap__ctl .atl-btn { font-size: 12px; min-height: 40px; min-width: 44px; }
+.tkt-cap__input { width: 96px !important; text-align: center; min-height: 40px; font-variant-numeric: tabular-nums; }
+.tkt-tier__actions { flex-wrap: wrap; }
+.tkt-tier__actions .atl-btn { min-height: 40px; }
+.tkt-tab-manage { align-self: flex-start; }
+
+.evt-card-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 10px 16px 14px; border-top: 1px solid var(--atl-line); margin-top: 4px; }
+.evt-card-actions .atl-btn { font-size: 12px; text-decoration: none; }
+.evt-card-actions .evt-tkt-line { flex: 1 0 100%; margin: 0 0 2px; font-size: 12px; color: var(--atl-muted); font-variant-numeric: tabular-nums; }
+.evt-card-actions .evt-tkt-line i { color: var(--atl-amber); margin-right: 4px; }
+.evt-card-actions .evt-tkt-line strong { color: var(--atl-ink); }
+.evt-tkt-flag { color: var(--atl-orange); font-weight: 600; }
+.evt-card-actions [hidden] { display: none !important; }
+@media (max-width: 640px) {
+    #tktManageDrawer .atl-drawer__body { padding: 16px 14px; }
+    .tkt-cap__ctl { gap: 6px; }
+    .tkt-cap__input { width: 84px !important; }
+    .tkt-cap-save { flex: 1 0 100%; }
+    .evt-card-actions .atl-btn { flex: 1 1 calc(50% - 8px); justify-content: center; }
+}
+
+/* section headings are <h6>: the global redesign.css h1-h6{color:var(--text-primary)!important} (white) hid them on the light panels */
+h6.tkt-h { color: var(--atl-muted) !important; }

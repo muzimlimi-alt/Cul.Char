@@ -1,0 +1,436 @@
+// Phase 5 (HOUSEKEEPING-NOTES.md): relocated from app.js verbatim — processNotificationQueue,
+// checkStuckNotifications, and startBackgroundClerk (which wires all three, plus the Google
+// Calendar hold sync, onto their intervals) moved together since they share the
+// _notificationSweepRunning single-flight guard and startBackgroundClerk calls the other two
+// directly. app.js still calls startBackgroundClerk() once, at the same module-load-time position.
+const db = require('../database');
+const moment = require('moment-timezone');
+const emailComponents = require('../js/emailComponents');
+const { sendEmail, pauseSending, isSendingPaused } = require('../js/emailService');
+const queuedAttachments = require('./queued-attachments');
+const inquiryMessages = require('./inquiry-messages');
+const inboxSync = require('./inbox-sync');
+const calendarM365 = require('./calendar-m365');
+const { syncCalendarHolds } = require('./calendar-sync');
+const notify = require('./notify');           // Notification Centre (docs-internal/notifications.md)
+const jobMonitor = require('./job-monitor');
+const { deleteGoogleEvent } = require('./google-calendar');
+const { getNotificationEmail } = require('../database/repositories/settings.repository');
+const {
+    getBookingById,
+    getStaleNewBookings, promoteBookingToPending, getConfirmedPaidPastEvents, markBookingAutoCompleted,
+    getStalePendingBookings, expirePendingBooking, getOverdueQuotedBookings, expireQuotedBooking,
+    clearBookingGoogleEventId, getQuotesExpiringTomorrow, markQuoteExpiryWarned,
+    getPendingEnquiriesNearingExpiry, markPendingExpiryWarned, markBookingOverdueReminded,
+} = require('../database/repositories/bookings.repository');
+const { markInvoicePaidForAutoComplete } = require('../database/repositories/invoices-quotations.repository');
+const { advanceAutoCompletedEventS6, getPastStandaloneEventsForAutoComplete, advanceStandaloneEventCompleted } = require('../database/repositories/calendar.repository');
+const { sendQuoteExpiredEmail, sendPendingExpiredEmail } = require('./scheduled-job-emails');
+const { sendBookingUnderReviewEmail, sendBookingCompletedEmail, sendAdminCompletionSummaryEmail, sendDepositBalanceDueEmail, sendQuoteExpiryWarningEmail } = require('./booking-notifications');
+
+// Single-flight guard: a batch (attachments / slow SMTP) can take longer than the 20s
+// setInterval, and two overlapping sweeps would double-send the same 'pending' rows. We serialize
+// in-process because an intra-DB claim isn't available — the notifications.status CHECK constraint
+// only permits ('pending','sent','failed','read','dismissed'), so the previous
+// `SET status='sending'` flip always failed the CHECK (its error was ignored), leaving the
+// double-send guard non-functional and sent_at never written.
+let _notificationSweepRunning = false;
+// An outcome write the sweep waits for (so what it records is visible to anything that reads the outbox straight after the sweep).
+const dbRunWait = (sql, params) => new Promise((resolve) => db.run(sql, params, () => resolve()));
+const SMTP_FAULT_PAUSE_MS = 5 * 60 * 1000;
+async function processNotificationQueue() {
+    if (_notificationSweepRunning) return; // a prior sweep is still draining the queue
+    if (isSendingPaused()) return;         // SMTP is down for a reason an admin must fix (see below) - don't hammer the server
+    _notificationSweepRunning = true;
+    try {
+        // Rows that have waited 24h behind a systemic SMTP fault are stale; give up on them rather than flooding a recipient
+        // with day-old mail the moment the fault is fixed. Only rows that already failed once (error_message set) qualify.
+        await new Promise((resolve) => db.run(
+            `UPDATE notifications SET status = 'failed', error_message = 'Not sent: the mail server was unavailable for 24 hours'
+             WHERE status = 'pending' AND channel = 'email' AND error_message IS NOT NULL
+             AND datetime(COALESCE(scheduled_at, created_at), '+24 hours') < datetime('now')`, [], () => resolve()));
+        // Process up to 10 pending notifications
+        const rows = await new Promise((resolve) => {
+            db.all(
+                `SELECT * FROM notifications
+                 WHERE status = 'pending' AND channel = 'email'
+                 AND (scheduled_at IS NULL OR scheduled_at <= datetime('now'))
+                 LIMIT 10`,
+                [],
+                (err, r) => {
+                    if (err) { console.error('[Notification Queue] Error fetching pending emails:', err.message); return resolve([]); }
+                    resolve(r || []);
+                }
+            );
+        });
+        if (rows.length === 0) return;
+
+        const { sendEmailDirectly } = require('../js/emailService');
+
+        for (const row of rows) {
+            let emailDetails = {};
+            try {
+                emailDetails = JSON.parse(row.body || '{}');
+            } catch (e) {
+                console.error(`[Notification Queue] Failed to parse body for notification #${row.id}:`, e.message);
+                await dbRunWait("UPDATE notifications SET status = 'failed', error_message = ? WHERE id = ?", ['JSON_PARSE_ERROR: ' + e.message, row.id]);
+                queuedAttachments.release(row.attachment_paths, row.id).catch(() => {});
+                continue;
+            }
+
+            // Rebuild the attachments exactly as they were queued (bytes, filename, content type). A row whose attachment data is gone is
+            // failed outright: sending it without the attachment would be a silent lie ("please review the attached ..." with nothing attached).
+            let attachments = [];
+            try {
+                attachments = await queuedAttachments.load(row.attachment_paths);
+            } catch (attErr) {
+                console.error(`[Notification Queue] Attachments for #${row.id} cannot be loaded:`, attErr.message);
+                await dbRunWait("UPDATE notifications SET status = 'failed', error_message = ? WHERE id = ?", ['ATTACHMENT_ERROR: ' + attErr.message.substring(0, 230), row.id]);
+                queuedAttachments.release(row.attachment_paths, row.id).catch(() => {});
+                continue;
+            }
+
+            try {
+                const result = await sendEmailDirectly({
+                    to: row.recipient_email,
+                    subject: row.subject,
+                    htmlContent: emailDetails.htmlContent,
+                    plainTextAlternative: emailDetails.plainTextAlternative,
+                    attachments: attachments,
+                    fromName: row.recipient_name || emailDetails.fromName || null,   // null = the configured sender name
+                    replyTo: emailDetails.replyTo,
+                    skipBrandAttachments: emailDetails.skipBrandAttachments,
+                    titleOverride: emailDetails.titleOverride,
+                    trigger_event: emailDetails.trigger_event || 'Notification Queue Dispatch',
+                    preWrapped: emailDetails.preWrapped,
+                    cc: emailDetails.cc,
+                    bcc: emailDetails.bcc,
+                    branding: emailDetails.branding,
+                    messageId: emailDetails.messageId,
+                    headers: emailDetails.headers
+                });
+
+                if (result.success) {
+                    await dbRunWait("UPDATE notifications SET status = 'sent', sent_at = CURRENT_TIMESTAMP WHERE id = ?", [row.id]);
+                    queuedAttachments.release(row.attachment_paths, row.id).catch(() => {});   // delivered: drop the stored bytes unless a sibling email still needs them
+                    console.log(`✓ [Notification Queue] Successfully sent email #${row.id} to ${row.recipient_email}`);
+                } else {
+                    const fault = new Error(result.error || 'SMTP_SEND_FAILED');
+                    fault.systemic = !!result.systemic;
+                    throw fault;
+                }
+            } catch (sendErr) {
+                if (sendErr.systemic) {
+                    // Every message would fail identically (credentials, SMTP AUTH, TLS, sender). Keep this row pending WITHOUT
+                    // burning a retry, say why, and pause the queue until the settings are saved/verified (or 5 minutes pass).
+                    await dbRunWait("UPDATE notifications SET error_message = ? WHERE id = ?", [sendErr.message.substring(0, 255), row.id]);
+                    pauseSending(SMTP_FAULT_PAUSE_MS);
+                    console.error(`⏸️ [Notification Queue] Mail server fault - email queue paused for ${SMTP_FAULT_PAUSE_MS / 60000} min: ${sendErr.message}`);
+                    break;
+                }
+                console.error(`❌ [Notification Queue] Failed to send email #${row.id} to ${row.recipient_email}:`, sendErr.message);
+                const newRetryCount = (row.retry_count || 0) + 1;
+                const nextStatus = newRetryCount >= 3 ? 'failed' : 'pending';
+                await dbRunWait(
+                    "UPDATE notifications SET status = ?, retry_count = ?, error_message = ? WHERE id = ?",
+                    [nextStatus, newRetryCount, sendErr.message.substring(0, 255), row.id]
+                );
+                if (nextStatus === 'failed') {
+                    queuedAttachments.release(row.attachment_paths, row.id).catch(() => {});   // gave up: nothing will retry it
+                    notify.emit('email.send_failed', { trigger: emailDetails.trigger_event || 'Notification Queue Dispatch', error: sendErr.message.substring(0, 200), outboxId: row.id });   // in-app only: the mail system is what failed
+                }
+            }
+        }
+    } finally {
+        // Admin replies to inquiries are only "accepted" / "failed" once the outbox says so - mirror that into the conversation now (and mark
+        // the inquiry replied for an accepted reply). Cheap when there is nothing open. Must never break the queue.
+        await inquiryMessages.reconcileDelivery().catch((e) => console.error('[Notification Queue] inquiry reconcile failed:', e.message));
+        _notificationSweepRunning = false;
+    }
+}
+
+async function checkStuckNotifications() {
+    db.get(
+        `SELECT COUNT(*) AS count FROM notifications
+         WHERE status IN ('pending', 'sending')
+         AND datetime(created_at, '+10 minutes') < datetime('now')`,
+        [],
+        async (err, row) => {
+            if (err) {
+                console.error('[Background Clerk] Error checking stuck notifications:', err.message);
+                return;
+            }
+            if (row && row.count === 0) notify.resolve('system.email_queue_stuck', { key: 'emailqueue' }, { note: 'The queue is moving again.' });
+            if (row && row.count > 0) {
+                const count = row.count;
+                notify.emit('system.email_queue_stuck', { count });   // in-app; the direct (queue-bypassing) e-mail below stays, because the queue is what is stuck
+                db.all(
+                    `SELECT id, recipient_email, subject, status, created_at FROM notifications
+                     WHERE status IN ('pending', 'sending')
+                     AND datetime(created_at, '+10 minutes') < datetime('now')
+                     ORDER BY created_at DESC LIMIT 5`,
+                    [],
+                    async (err2, details) => {
+                        const notifEmail = await getNotificationEmail();
+                        const { sendEmailDirectly } = require('../js/emailService');
+                        const body = emailComponents.renderSystemEmail({
+                            preheaderText: `${count} notification(s) stuck in the queue for over 10 minutes.`,
+                            category: 'System',
+                            severity: 'alert',
+                            leadFact: `There are <strong style="color:#FAFAFA;">${count}</strong> notification(s) stuck in the queue for more than 10 minutes.`,
+                            bodyHtml: `<p style="margin:0; color:#E6E6E6;">This may indicate that the background queue processor is down, experiencing high latency, or has crashed.</p>`,
+                            cards: (details || []).length ? [{
+                                title: 'Stuck Notifications',
+                                rows: (details || []).map(d => ({ label: `#${d.id} (${d.status})`, value: `To ${d.recipient_email} · ${d.created_at}`, mono: false }))
+                            }] : []
+                        });
+
+                        await sendEmailDirectly({
+                            to: notifEmail,
+                            subject: `⚠️ Alert: ${count} Stuck Notification(s) in Queue`,
+                            htmlContent: body,
+                            preWrapped: true,
+                            titleOverride: 'Stuck Notification Alert',
+                            trigger_event: 'System: Stuck Notification Alert',
+                            skipBrandAttachments: true
+                        }).catch(sendErr => console.error('[Background Clerk] Failed to send stuck notifications alert:', sendErr.message));
+                    }
+                );
+            }
+        }
+    );
+}
+
+/**
+ * Periodically cleans up expired holds and pending bookings
+ */
+function startBackgroundClerk() {
+    console.log('Starting [Background Clerk] - Monitoring holds and expirations...');
+
+    // Sync Google Calendar holds every 15 minutes
+    const holdsRun = jobMonitor.monitored('calendar-holds-sync', 'Google Calendar hold sync', 15 * 60 * 1000, syncCalendarHolds);
+    setInterval(() => holdsRun().catch(() => {}), 15 * 60 * 1000);
+    // Also run it immediately on start
+    holdsRun().catch(() => {});
+
+    // Sweep and process asynchronous email queue every 20 seconds
+    setInterval(processNotificationQueue, 20 * 1000);
+    processNotificationQueue();
+    // Customer replies from the booking mailbox into Inquiries (Microsoft Graph). Checked every minute, runs only when an administrator has switched it on
+    // and is due; a no-op (one tiny query) otherwise.
+    setInterval(() => inboxSync.runIfDue().catch(e => console.error('[inbox-sync]', e.message)), 60 * 1000);
+    // The shared Microsoft 365 calendar (lib/calendar-m365.js): pull what changed there, push what the website wants on it. Same rules: off until an administrator
+    // switches it on, one tiny query when off. Bookings / events also nudge it (requestSync) so a change shows up within seconds; this is the safety net.
+    setInterval(() => calendarM365.runIfDue().catch(e => console.error('[calendar-m365]', e.message)), 60 * 1000);
+    // Delete queued-attachment bytes that nothing references any more (crash leftovers, anonymised or expired rows) - hourly
+    setInterval(() => queuedAttachments.sweepOrphans().catch(e => console.error('[Attachment sweep]', e.message)), 60 * 60 * 1000);
+    setTimeout(() => queuedAttachments.sweepOrphans().catch(() => {}), 90 * 1000);
+
+    // Check for stuck email notifications every 10 minutes
+    setInterval(checkStuckNotifications, 10 * 60 * 1000);
+    // Run once on startup after 30 seconds
+    setTimeout(checkStuckNotifications, 30 * 1000);
+
+    setInterval(() => {
+      try {
+        const nowLocal = moment().tz('Africa/Johannesburg').format('YYYY-MM-DD HH:mm:ss');
+        const todayLocal = moment().tz('Africa/Johannesburg').format('YYYY-MM-DD');
+        const tomorrowLocal = moment().tz('Africa/Johannesburg').add(1, 'day').format('YYYY-MM-DD');
+        const overdueLimitLocal = moment().tz('Africa/Johannesburg').subtract(7, 'days').format('YYYY-MM-DD HH:mm:ss');
+
+        // S0: Promote stale NEW bookings to PENDING after 24 hours with no admin action
+        getStaleNewBookings(nowLocal, (err, rows) => {
+            if (rows && rows.length > 0) {
+                rows.forEach(row => {
+                    promoteBookingToPending(row.id);
+                    sendBookingUnderReviewEmail(row).catch(e => console.error(`[S0] Under-review email failed for #${row.id}:`, e.message));
+                });
+                console.log(`✓ [S0] Promoted ${rows.length} NEW booking(s) to PENDING after 24h.`);
+            }
+        });
+
+        // S6: Auto-complete CONFIRMED fully-paid bookings whose event date has passed
+        getConfirmedPaidPastEvents(todayLocal, (err, rows) => {
+            if (rows && rows.length > 0) {
+                rows.forEach(row => {
+                    markBookingAutoCompleted(row.id);
+                    if (row.event_id) {
+                        advanceAutoCompletedEventS6(row.event_id, (e) => { if (e) console.error('[AutoComplete] Event advance failed:', e.message); });
+                    }
+                    // Parity with manual completion (applyStatusChange): also mark the linked invoice PAID
+                    // and send the admin completion summary — not just the client completion email.
+                    markInvoicePaidForAutoComplete(row.id,
+                        (e) => { if (e) console.error('[S6] Invoice mark-paid failed:', e.message); });
+                    sendBookingCompletedEmail(row).catch(e =>
+                        console.error(`[S6] Completion email failed for #${row.id}:`, e.message)
+                    );
+                    getBookingById(row.id, (e, full) => {
+                        if (!e && full) sendAdminCompletionSummaryEmail(full).catch(err => console.error(`[S6] Admin completion summary failed for #${row.id}:`, err.message));
+                    });
+                });
+                console.log(`✓ [S6] Auto-completed ${rows.length} fully-paid past-event booking(s) (completion + admin summary emails sent).`);
+            }
+        });
+
+        // S7: Auto-complete standalone public events (no linked booking) whose date has passed.
+        // Booking-linked events already advance via S6 above - a standalone event (created directly
+        // in the Events module) had no equivalent, so it could sit at "Upcoming" indefinitely after
+        // the show had already happened, until an admin noticed and fixed it manually.
+        getPastStandaloneEventsForAutoComplete(nowLocal, (err, rows) => {
+            if (rows && rows.length > 0) {
+                rows.forEach(row => {
+                    advanceStandaloneEventCompleted(row.event_id);
+                });
+                console.log(`✓ [S7] Auto-completed ${rows.length} past standalone event(s).`);
+            }
+        });
+
+        // 1. Expire unquoted PENDING bookings after 48 hours of inactivity
+        getStalePendingBookings(nowLocal, (err, rows) => {
+            if (rows && rows.length > 0) {
+                rows.forEach(row => {
+                    expirePendingBooking(row.id);
+                    notify.emit('bookings.request_expired', { bookingId: row.id });
+                    notify.resolve('bookings.request_received', row.id, { note: 'Expired after 48 hours without a quote.' });
+                    sendPendingExpiredEmail(row).catch(e => console.error(`Expiry email failed for booking #${row.id}:`, e.message));
+                });
+                console.log(`✓ Expired ${rows.length} inactive pending requests (clients notified).`);
+            }
+        });
+
+        // 2. Expire QUOTED bookings after quote_expiry_date
+        getOverdueQuotedBookings(todayLocal, (err, rows) => {
+            if (rows && rows.length > 0) {
+                rows.forEach(row => {
+                    expireQuotedBooking(row.id);
+                    // Null the local ID once we've asked Google to delete it — otherwise every future
+                    // syncBookingToCalendar() for this booking takes the "already synced" update branch
+                    // against an event that no longer exists on Google, fails, and never re-creates it.
+                    if (row.google_event_id) {
+                        deleteGoogleEvent(row.google_event_id);
+                        clearBookingGoogleEventId(row.id);
+                    }
+                    sendQuoteExpiredEmail(row).catch(e => console.error(`Quote expiry email failed for booking #${row.id}:`, e.message));
+                    notify.emit('bookings.quote_expired', { bookingId: row.id, clientName: row.name });
+                    notify.resolve('bookings.revision_requested', row.id, { note: 'The quote expired.' });
+                });
+                console.log(`✓ Expired ${rows.length} overdue quotes (clients notified).`);
+            }
+        });
+
+        // 3. Warn clients 24h before quote expires
+        getQuotesExpiringTomorrow(tomorrowLocal, (err, rows) => {
+            if (rows && rows.length > 0) {
+                rows.forEach(row => {
+                    markQuoteExpiryWarned(row.id);
+                    sendQuoteExpiryWarningEmail(row).catch(e => console.error('Quote warning email failed:', e.message));
+                });
+            }
+        });
+
+        // 3b. Warn the ADMIN about PENDING enquiries about to auto-expire — the final window
+        // before step 1 auto-EXPIRES them at 48h from creation. Prevents leads being silently
+        // lost. One digest per enquiry (pending_expiry_warned flag stops hourly re-spam).
+        getPendingEnquiriesNearingExpiry(nowLocal, async (err, rows) => {
+            if (rows && rows.length > 0) {
+                const notifEmail = await getNotificationEmail();
+                rows.forEach(row => {
+                    markPendingExpiryWarned(row.id);
+                });
+                const digestBody = emailComponents.renderSystemEmail({
+                    preheaderText: `${rows.length} enquiry(ies) expiring within ~24 hours.`,
+                    category: 'Booking Requests',
+                    severity: 'action',
+                    leadFact: `The following enquiries will <strong style="color:#FAFAFA;">auto-expire within the next ~24 hours</strong> unless a quote is sent. After that, the client is notified that their request lapsed.`,
+                    bodyHtml: `<p style="margin:0; color:#E6E6E6;">Open the Bookings pipeline and send a quote to keep them alive.</p>`,
+                    cards: [{
+                        title: 'Expiring Enquiries',
+                        rows: rows.map(r => ({ label: `#${r.id}: ${r.name}`, value: `${r.event_name || r.event_type || 'Event'}${r.date ? ' (event ' + r.date + ')' : ''}`, mono: false }))
+                    }]
+                });
+                sendEmail({ to: notifEmail, subject: `Enquiries expiring soon – ${rows.length} pending request(s) need a quote`,
+                    htmlContent: digestBody, preWrapped: true,
+                    titleOverride: 'Enquiries Expiring Soon', trigger_event: 'Admin: Pending Expiry Warning' }).catch(() => {});
+                console.log(`✓ [3b] Warned admin about ${rows.length} pending enquiry(ies) nearing auto-expiry.`);
+            }
+        });
+
+        // 4. Overdue payment reminder (CONFIRMED, unpaid, event date passed)
+        db.all(`SELECT b.*, COALESCE(c.email, b.email) as email, COALESCE(c.full_name, b.name) as name
+                FROM bookings b LEFT JOIN clients c ON b.client_id = c.id
+                WHERE b.status = 'CONFIRMED'
+                AND b.payment_status NOT IN ('PAID')
+                AND b.date < ?
+                AND (b.overdue_reminded_at IS NULL OR b.overdue_reminded_at < ?)`, [todayLocal, overdueLimitLocal], async (err, rows) => {
+            if (rows && rows.length > 0) {
+                const notifEmail = await getNotificationEmail();
+                rows.forEach(row => {
+                    markBookingOverdueReminded(row.id);
+                });
+                const totalOverdue = rows.reduce((sum, r) => sum + parseFloat(r.amount_outstanding || 0), 0);
+                const digestBody = emailComponents.renderSystemEmail({
+                    preheaderText: `${rows.length} overdue booking(s), R${totalOverdue.toFixed(2)} outstanding.`,
+                    category: 'Payments & Invoices',
+                    severity: 'alert',
+                    leadFact: `The following confirmed bookings have unpaid balances with past event dates.`,
+                    cards: [{
+                        title: 'Overdue Bookings',
+                        rows: rows.map(r => ({ label: `#${r.id}: ${r.name}`, value: `R${parseFloat(r.amount_outstanding || 0).toFixed(2)} outstanding`, mono: false }))
+                    }]
+                });
+                sendEmail({ to: notifEmail, subject: `Overdue Payments – ${rows.length} booking(s), R${totalOverdue.toFixed(2)} due`,
+                    htmlContent: digestBody, preWrapped: true,
+                    titleOverride: 'Overdue Payment Alert', trigger_event: 'Admin: Overdue Payment Digest' }).catch(() => {});
+            }
+        });
+
+        // 5. Pre-event balance reminders: 7, 3, 1 days before event for CONFIRMED bookings with outstanding balance
+        for (const daysBefore of [7, 3, 1]) {
+            const targetStr = moment().tz('Africa/Johannesburg').add(daysBefore, 'days').format('YYYY-MM-DD');
+
+            db.all(`SELECT b.id, COALESCE(c.full_name, b.name) as name, COALESCE(c.email, b.email) as email,
+                           b.event_name, b.event_type, b.date, b.amount_outstanding, b.total_amount
+                    FROM bookings b LEFT JOIN clients c ON b.client_id = c.id
+                    WHERE b.status = 'CONFIRMED'
+                      AND b.date = ?
+                      AND b.amount_outstanding > 0.01`,
+                [targetStr], (err, rows) => {
+                    if (err || !rows || rows.length === 0) return;
+                    rows.forEach(row => {
+                        // Idempotency keyed on the table's real columns. This used to SELECT and INSERT a
+                        // `reminder_type` column that does not exist on reminders_log — the SELECT errored,
+                        // its callback saw no prior row, so the reminder was RE-SENT every hour, and the
+                        // INSERT errored too so nothing was ever recorded. These are event-based (not tied
+                        // to a payment_schedules milestone), so schedule_id is NULL and days_before (7/3/1)
+                        // distinguishes them; the milestone reminders (which always carry a non-NULL
+                        // schedule_id) can never collide with this key.
+                        db.get("SELECT id FROM reminders_log WHERE booking_id = ? AND schedule_id IS NULL AND days_before = ?",
+                            [row.id, daysBefore], (e, existing) => {
+                                if (e) { console.error(`Balance-due reminder lookup failed for #${row.id}:`, e.message); return; }
+                                if (existing) return; // already sent this window — do not re-send
+                                sendDepositBalanceDueEmail(row, row.amount_outstanding)
+                                    .then(() => {
+                                        db.run("INSERT OR IGNORE INTO reminders_log (booking_id, schedule_id, days_before, due_date, amount_due, recipient_email, status) VALUES (?, NULL, ?, ?, ?, ?, 'sent')",
+                                            [row.id, daysBefore, row.date, row.amount_outstanding, row.email],
+                                            (insErr) => { if (insErr) console.error(`Balance-due reminder log failed for #${row.id}:`, insErr.message); });
+                                        console.log(`✓ Balance-due reminder (${daysBefore}d) sent for booking #${row.id}`);
+                                    })
+                                    .catch(e => console.error(`Balance-due reminder failed for #${row.id}:`, e.message));
+                            });
+                    });
+                }
+            );
+        }
+
+        // Google Calendar holds synchronization is run outside this interval to prevent duplicate timers
+
+        jobMonitor.beat('lifecycle-sweep', 'Hourly booking lifecycle sweep', 3600000);
+      } catch (clerkErr) {
+          console.error('[Background Clerk] Unhandled error in interval:', clerkErr.message);
+          jobMonitor.beat('lifecycle-sweep', 'Hourly booking lifecycle sweep', 3600000, false, clerkErr);
+      }
+    }, 3600000); // Run every hour
+}
+
+// processNotificationQueue is exported for test/smtp-transport.child.js (queue behaviour against a fake SMTP server).
+module.exports = { startBackgroundClerk, processNotificationQueue };

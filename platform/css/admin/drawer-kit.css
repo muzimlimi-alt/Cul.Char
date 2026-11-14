@@ -1,0 +1,313 @@
+/* =====================================================================
+   ADMIN DRAWER KIT  (.dk-*)  — the shared inside of every admin drawer.
+
+   WHAT IT IS
+   The Track Your Booking drawer's layout (cards with an icon + summary + chevron, label/value rows, status badges, an even button row,
+   a round close button) as a reusable kit on top of the existing drawer shell (.atl-drawer in 15-services-catalogue.css). A drawer opts in
+   with ONE class on its root: .atl-drawer--dk. Drawers that have not been converted are untouched.
+
+   COLOURS: NONE OF ITS OWN
+   Every colour, border, shadow, radius, spacing and focus value below is an existing --atl-* token (css/core/tokens.css + themes.css), so
+   the kit follows the Appearance system (js/appearance.js: Finish x Accent x Presence) with no extra code:
+     - Finish  (dark / light / ember) re-point --atl-paper/card/surface2/ink/muted/line*, so surfaces and text follow;
+     - Accent  (gold / vetiver / cassis / cuivre) re-points --atl-amber*, which is the accent everywhere;
+     - Presence (editorial / boutique / operations) changes --atl-sp-*, which every gap and padding here uses.
+   An open drawer re-resolves the moment <html data-theme|accent|presence> changes (CSS variables cascade), so nothing needs a refresh, and
+   the pre-paint script in admin.html means no flash. test/browser/drawer-kit.js proves this for every combination and fails the build if
+   a colour literal (#hex, rgb(), hsl()) ever appears in this file.
+
+   RULES FOR THIS FILE
+   - No hex / rgb() / hsl() literals. Tinted fills use rgba(var(--atl-*-rgb), a) or color-mix() on a token.
+   - No new tokens (css/core/tokens.css asks for proof + a log entry first). Spacing = --atl-sp-*, radius = --atl-r-*.
+   - Never a heading element (h1-h6) for card titles: redesign.css forces h1-h6 colour/font with !important (the "heading bleed" seen in
+     .atl-edit-card__title) - the kit uses spans/divs so nothing has to fight it.
+   ===================================================================== */
+
+/* ── Shell: what the converted drawer adds to .atl-drawer ───────────────────────────────────────────────────────────────────────── */
+/* The body sits on the page surface and the cards sit on the card surface, so every card is distinguishable from its background in every Finish
+   (dark: #0a0a0a / #1a1a1a, light: #f2eee6 / #fffdf8, ember: #110c08 / #221a11) - the same relationship the Track drawer uses. */
+.atl-drawer--dk .atl-drawer__body {
+    background: var(--atl-paper);
+    padding: var(--atl-sp-lg);
+    display: flex; flex-direction: column; gap: var(--atl-sp-md);
+}
+/* The body is a scrolling flex column: without this its children SHRINK to fit instead of scrolling (the facts band collapsed to a line, cards crushed their own rows). */
+.atl-drawer--dk .atl-drawer__body > * { flex: none; }
+.atl-drawer--dk .atl-drawer__header { padding: var(--atl-sp-md) var(--atl-sp-lg); min-height: 72px; }
+.atl-drawer--dk .atl-drawer__footer { padding-left: var(--atl-sp-lg); padding-right: var(--atl-sp-lg); }
+
+/* A wrapper whose children are cards (a drawer whose content is written by JavaScript): same rhythm as the body itself. */
+.dk-stack { display: flex; flex-direction: column; gap: var(--atl-sp-md); }
+.dk-stack > * { flex: none; }
+
+/* Header: icon tile + serif title (+ optional subtitle) on the left, round close button on the right. */
+.dk-head { display: flex; align-items: center; gap: var(--atl-sp-md); min-width: 0; }
+.dk-icon {
+    flex: none; width: 40px; height: 40px; border-radius: var(--atl-r-lg);
+    display: grid; place-items: center; font-size: 16px;
+    background: var(--atl-amber-dim); color: var(--atl-amber); border: 1px solid var(--atl-amber-border);
+}
+.dk-head__text { min-width: 0; }
+.atl-drawer--dk .atl-drawer__header .dk-title,
+.atl-drawer--dk-lite .atl-drawer__header .dk-title {      /* (0,3,0): the shell's  .atl-drawer__header h5  (0,1,1) would otherwise set it to 15px sans */
+    margin: 0; font-family: 'Cormorant Garamond', Georgia, serif; font-size: 22px; font-weight: 500; line-height: 1.15;
+    color: var(--atl-ink) !important;          /* beats redesign.css's h1-h6 colour (see the rules above) */
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.dk-sub { margin: 2px 0 0; font-size: 12px; color: var(--atl-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.atl-drawer--dk .atl-drawer__header h5, .atl-drawer--dk-lite .atl-drawer__header h5.dk-title { display: block; margin: 0; }     /* the shell makes it a flex row; the kit lays the header out itself */
+.atl-drawer--dk .atl-drawer__close,
+.atl-drawer--dk-lite .atl-drawer__close {
+    flex: none; width: 40px; height: 40px; padding: 0; border-radius: 50%;
+    display: grid; place-items: center; font-size: 20px;
+    border: 1px solid var(--atl-line-strong); color: var(--atl-ink);
+    background: color-mix(in srgb, var(--atl-ink) 5%, transparent);
+}
+/* the admin's global :focus-visible (12-focus-accessibility.css) forces border-radius: 2px !important on anything focused, which squares a round button and its ring */
+.atl-drawer--dk .atl-drawer__close:focus-visible,
+.atl-drawer--dk-lite .atl-drawer__close:focus-visible { border-radius: 50% !important; }
+.dk-card > summary:focus-visible { border-radius: var(--atl-r-lg) !important; }
+.atl-drawer--dk .atl-drawer__close:hover,
+.atl-drawer--dk-lite .atl-drawer__close:hover { border-color: var(--atl-amber); color: var(--atl-amber); background: var(--atl-amber-dim); }
+
+/* ── Summary band: the 3-4 facts you look for first ─────────────────────────────────────────────────────────────────────────── */
+.dk-facts {
+    display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1px;
+    background: var(--atl-line); border: 1px solid var(--atl-line-strong); border-radius: var(--atl-r-lg); overflow: hidden;
+}
+.dk-fact { background: var(--atl-card); padding: var(--atl-sp-md); min-width: 0; }
+.dk-fact__k { display: block; font-size: var(--atl-eyebrow-size); letter-spacing: .14em; text-transform: uppercase; color: var(--atl-muted); margin-bottom: 6px; }
+.dk-fact__v { display: block; font-size: 15px; font-weight: 600; line-height: 1.3; color: var(--atl-ink); overflow-wrap: anywhere; }
+.dk-fact__v--accent { color: var(--atl-amber); }
+.dk-facts--3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.dk-fact__v--ok { color: var(--atl-green); }
+.dk-fact__v--warn { color: var(--atl-orange); }
+.dk-fact__v--bad { color: var(--atl-clay); }
+.dk-fact__v--money, .dk-v--money { font-variant-numeric: tabular-nums; }   /* --atl-green, not --atl-sage: sage is 3.9:1 on the Ivory card (fails AA for text), green is retuned darker there */
+
+/* ── Card: a collapsible <details> (works without JavaScript, keyboard and screen-reader friendly) ──────────────────────────────── */
+.dk-card { background: var(--atl-card); border: 1px solid var(--atl-amber-border); border-radius: var(--atl-r-lg); }
+.dk-card > summary {
+    list-style: none; cursor: pointer; display: flex; align-items: center; gap: 10px;
+    padding: 14px var(--atl-sp-md); min-height: var(--atl-tap); border-radius: var(--atl-r-lg);
+}
+.dk-card > summary::-webkit-details-marker { display: none; }
+.dk-card > summary:hover { background: color-mix(in srgb, var(--atl-ink) 3%, transparent); }
+.dk-card > summary:focus-visible { outline: 2px solid var(--atl-focus); outline-offset: -2px; }
+.dk-card__icon { flex: none; width: 18px; text-align: center; color: var(--atl-amber); font-size: 14px; }
+.dk-card__title { font-size: 14px; font-weight: 700; color: var(--atl-ink); }
+.dk-card__note { margin-left: auto; min-width: 0; font-size: 12px; color: var(--atl-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; }
+.dk-card__chev { flex: none; margin-left: auto; color: var(--atl-amber); font-size: 12px; transition: transform var(--atl-t-fast); }
+.dk-card__note + .dk-card__chev { margin-left: 4px; }                       /* with a note, the note takes the free space and the chevron follows it */
+.dk-card:not([open]) > summary .dk-card__chev { transform: rotate(180deg); }  /* the arrow points up when open, down when closed */
+.dk-card__body { padding: 0 var(--atl-sp-md) var(--atl-sp-md); }
+
+/* Inset panel inside a card (the Track drawer's darker inner block): quotes, notes, tables. */
+.dk-inset {
+    background: var(--atl-paper); border: 1px solid var(--atl-line); border-radius: var(--atl-r-lg);
+    padding: var(--atl-sp-md); font-size: 13px; line-height: 1.55; color: var(--atl-ink-dim);
+    white-space: pre-wrap; overflow-wrap: anywhere; max-height: 260px; overflow-y: auto;
+}
+.dk-inset--flag { background: var(--atl-amber-dim); border-color: var(--atl-amber-border); white-space: normal; }
+.dk-inset strong { color: var(--atl-ink); }
+.dk-inset__line + .dk-inset__line { margin-top: var(--atl-sp-sm); }
+
+/* ── Label / value rows ─────────────────────────────────────────────────────────────────────────────────────────────────────────── */
+.dk-rows { margin: 0; padding: 0; }
+.dk-row {
+    display: grid; grid-template-columns: minmax(96px, 34%) minmax(0, 1fr); column-gap: var(--atl-sp-md);
+    align-items: baseline; padding: 11px 0; border-top: 1px solid var(--atl-line);
+}
+.dk-row:first-child { border-top: 0; padding-top: 6px; }
+.dk-row:last-child { padding-bottom: 2px; }
+.dk-k { margin: 0; font-size: 12px; color: var(--atl-muted); }
+.dk-v { margin: 0; font-size: 13px; font-weight: 600; color: var(--atl-ink); overflow-wrap: anywhere; }
+.dk-v a { color: var(--atl-amber); text-decoration: none; }
+.dk-v a:hover { color: var(--atl-amber-hover); text-decoration: underline; }
+.dk-v--plain { font-weight: 400; }
+.dk-v--muted { color: var(--atl-muted); font-weight: 400; }
+.dk-v--ok { color: var(--atl-green); }
+.dk-v--bad { color: var(--atl-clay); }
+.dk-v--warn { color: var(--atl-orange); }
+/* money rows: a sub-line under its parent (an expense under Expenses) and the closing total */
+.dk-row--sub { padding: 5px 0 5px var(--atl-sp-md); border-top: 0; }
+.dk-row--sub .dk-k, .dk-row--sub .dk-v { font-size: 12px; font-weight: 400; }
+.dk-row--total { border-top: 1px solid var(--atl-line-strong); margin-top: 4px; padding-top: 14px; }
+.dk-row--total .dk-k { font-size: 13px; font-weight: 700; color: var(--atl-ink); }
+.dk-row--total .dk-v { font-size: 15px; font-weight: 700; }
+/* a card body that is still loading, or has nothing to show */
+.dk-empty { padding: var(--atl-sp-md) 0; text-align: center; font-size: 13px; color: var(--atl-muted); }
+.dk-empty--bad { color: var(--atl-clay); }
+.dk-card__body > .dk-actions { margin-top: var(--atl-sp-md); }
+
+/* ── Status badges: always text + colour (never colour alone). Text = the semantic token pulled slightly toward this Finish's ink so it stays AA on its own tint ───────────────────────── */
+.dk-badge {
+    display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px; border-radius: var(--atl-r-pill);
+    font-size: 11px; font-weight: 700; letter-spacing: .02em; line-height: 1.4; white-space: nowrap;
+    background: var(--atl-amber-dim); border: 1px solid var(--atl-amber-border);
+    /* the accent pulled toward this Finish's ink: always AA on its own tint (plain --atl-amber is 4.2:1 on Ivory at this size) */
+    color: color-mix(in srgb, var(--atl-amber) 78%, var(--atl-ink));
+}
+.dk-badge--ok   { background: rgba(var(--atl-sage-rgb), .14);   color: color-mix(in srgb, var(--atl-green) 82%, var(--atl-ink));  border-color: rgba(var(--atl-sage-rgb), .35); }
+.dk-badge--warn { background: rgba(var(--atl-orange-rgb), .14); color: color-mix(in srgb, var(--atl-orange) 82%, var(--atl-ink)); border-color: rgba(var(--atl-orange-rgb), .35); }
+.dk-badge--bad  { background: rgba(var(--atl-clay-rgb), .14);   color: color-mix(in srgb, var(--atl-clay) 82%, var(--atl-ink));   border-color: rgba(var(--atl-clay-rgb), .35); }
+.dk-badge--info { background: rgba(var(--atl-blue-rgb), .14);   color: color-mix(in srgb, var(--atl-blue) 82%, var(--atl-ink));   border-color: rgba(var(--atl-blue-rgb), .35); }
+
+/* ── Forms: a label above each field, two columns that collapse to one, inputs that follow the Finish ─────────────────────────── */
+.dk-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--atl-sp-md); }
+.dk-field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.dk-field--wide { grid-column: 1 / -1; }
+.dk-label { font-size: 12px; font-weight: 600; color: var(--atl-ink-dim); }
+.dk-hint { font-size: 11px; line-height: 1.4; color: var(--atl-muted); }
+/* Field controls. The admin sets input look globally with !important and a long selector (07-components.css: body.admin-body input:not([type=...])..., (0,6,2);
+   redesign.css .admin-body input), so these rules repeat that :not() chain plus the drawer and field classes (0,9,2) to outrank it by specificity. They set the
+   tokens the drawers need: a bold border (a field's edge must be seen: --atl-line is only 1.1:1 on the card), 44px target, a focus ring from --atl-focus. */
+body.admin-body .atl-drawer--dk .dk-field input.atl-input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not(.adm-search__input),
+body.admin-body .atl-drawer--dk .dk-field textarea.atl-input,
+body.admin-body .atl-drawer--dk .dk-field select.atl-input {
+    width: 100%; min-height: var(--atl-tap) !important; font-size: 14px !important;
+    padding: 8px 12px !important; color: var(--atl-ink) !important; background: var(--atl-input-bg) !important;
+    border: 1px solid var(--atl-line-bold) !important; border-radius: var(--atl-r-lg) !important;
+}
+body.admin-body .atl-drawer--dk .dk-field input.atl-input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not(.adm-search__input):focus,
+body.admin-body .atl-drawer--dk .dk-field textarea.atl-input:focus,
+body.admin-body .atl-drawer--dk .dk-field select.atl-input:focus {
+    border-color: var(--atl-focus) !important; box-shadow: 0 0 0 3px var(--atl-focus-ring) !important; outline: none !important;
+}
+body.admin-body .atl-drawer--dk .dk-field textarea.atl-input { min-height: 96px !important; resize: vertical; line-height: 1.5; }
+/* Labels. The admin forces every <label> to 11px bold CAPITALS with wide spacing (07-components.css `label {...!important}`); the kit's labels are sentence case at
+   13px like its row labels, so a field reads as a question. Same for the checkbox label and a label used as a button (the receipt Upload). */
+body.admin-body .atl-drawer--dk .dk-label {
+    font-family: 'Outfit', sans-serif !important; font-size: 13px !important; font-weight: 600 !important; text-transform: none !important; letter-spacing: 0 !important; color: var(--atl-ink-dim) !important;
+}
+body.admin-body .atl-drawer--dk .dk-label .dk-hint { font-size: 12px !important; font-weight: 400 !important; text-transform: none !important; letter-spacing: 0 !important; color: var(--atl-muted) !important; }
+body.admin-body .atl-drawer--dk .dk-label .atl-req { color: var(--atl-required) !important; }
+body.admin-body .atl-drawer--dk label.dk-check { font-size: 13px !important; font-weight: 400 !important; text-transform: none !important; letter-spacing: 0 !important; color: var(--atl-ink) !important; }
+body.admin-body .atl-drawer--dk .dk-field__row label.atl-btn { font-size: 13px !important; font-weight: 600 !important; text-transform: none !important; letter-spacing: 0 !important; color: var(--atl-ink) !important; cursor: pointer; margin: 0; }
+/* Read-only fields. The admin dims every readonly input to 60% (07-components.css `input[readonly]`). A date picker's field is readonly too (flatpickr: you pick, you do not
+   type), so it would look disabled. Pickers stay fully opaque; only a COMPUTED field (Total km) gets the read-only look: muted text on the raised surface. */
+body.admin-body .atl-drawer--dk .dk-field input.flatpickr-input[readonly] { opacity: 1 !important; cursor: pointer !important; }
+body.admin-body .atl-drawer--dk .dk-field input.atl-input[readonly]:not(.flatpickr-input):not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not(.adm-search__input) {
+    opacity: 1 !important; cursor: default !important; background: var(--atl-surface2) !important; color: var(--atl-muted) !important;
+}
+.dk-check { display: flex; align-items: flex-start; gap: 10px; font-size: 13px; line-height: 1.45; color: var(--atl-ink); cursor: pointer; }
+.dk-check input { flex: none; margin-top: 2px; width: 16px; height: 16px; accent-color: var(--atl-amber); }
+
+/* ── Notices: something the admin must read before acting. Text stays in the Finish's ink; the colour is the icon, border and tint ── */
+.dk-notice {
+    display: flex; align-items: flex-start; gap: 10px; padding: 12px var(--atl-sp-md); border: 1px solid; border-radius: var(--atl-r-lg);
+    font-size: 13px; line-height: 1.5; color: var(--atl-ink);
+}
+.dk-notice > i { flex: none; margin-top: 3px; }
+.dk-notice--warn { background: rgba(var(--atl-orange-rgb), .12); border-color: rgba(var(--atl-orange-rgb), .45); }
+.dk-notice--warn > i { color: var(--atl-orange); }
+.dk-notice--bad  { background: rgba(var(--atl-clay-rgb), .12);   border-color: rgba(var(--atl-clay-rgb), .45); }
+.dk-notice--bad > i { color: var(--atl-clay); }
+.dk-notice--info { background: rgba(var(--atl-blue-rgb), .12);   border-color: rgba(var(--atl-blue-rgb), .45); }
+.dk-notice--info > i { color: var(--atl-blue); }
+
+/* ── A file or image shown in a card (proof of payment, a document preview) ─────────────────────────────────────────────────── */
+.dk-media { text-align: center; padding: var(--atl-sp-md); background: var(--atl-paper); border: 1px solid var(--atl-line); border-radius: var(--atl-r-lg); font-size: 13px; color: var(--atl-muted); }
+.dk-media img { display: block; margin: 0 auto; max-width: 100%; max-height: 360px; border-radius: var(--atl-r-md); }
+
+/* ── History: one line per event ─────────────────────────────────────────────────────────────────────────────────────────────── */
+.dk-timeline { list-style: none; margin: 0; padding: 0; font-size: 12px; }
+.dk-timeline li { padding: 10px 0; border-top: 1px solid var(--atl-line); line-height: 1.5; color: var(--atl-muted); }
+.dk-timeline li:first-child { border-top: 0; padding-top: 2px; }
+.dk-timeline strong { color: var(--atl-ink); text-transform: capitalize; }
+
+/* ── Panels: a titled group of fields in a form drawer. Same look as a card but never collapsible, so an error can never be hidden inside a folded one ── */
+.dk-panel { background: var(--atl-card); border: 1px solid var(--atl-amber-border); border-radius: var(--atl-r-lg); }
+.dk-panel__head { display: flex; align-items: center; gap: 10px; padding: 14px var(--atl-sp-md) 0; }
+.dk-panel__body { padding: var(--atl-sp-md); }
+.atl-req { color: var(--atl-required); }                                  /* the required-field star: the accent, so it follows the Appearance accent */
+.dk-field__row { display: flex; align-items: center; gap: 8px; }
+.dk-field__row > .atl-input { flex: 1; min-width: 0; }
+.dk-hint--ok { color: var(--atl-green); }
+.dk-hint--bad { color: var(--atl-clay); }
+.dk-notice--ok { background: rgba(var(--atl-sage-rgb), .12); border-color: rgba(var(--atl-sage-rgb), .45); }
+.dk-notice--ok > i { color: var(--atl-green); }
+.dk-msg { margin-top: var(--atl-sp-md); }
+.dk-msg:empty { display: none; }                                          /* written by dkMessage() in js/admin/drawer-kit.js */
+/* a file picker: a dashed drop-box look, still a real input */
+body.admin-body .atl-drawer--dk .dk-field input[type="file"] {
+    width: 100%; min-height: var(--atl-tap); padding: 9px 12px; font-size: 13px;
+    color: var(--atl-ink) !important; background: var(--atl-input-bg) !important; border: 1px dashed var(--atl-line-bold); border-radius: var(--atl-r-lg);
+}
+
+/* ── Neutral badge (a draft, an inactive thing): muted, never colour alone ────────────────────────────────────────────────────── */
+.dk-badge--neutral { background: color-mix(in srgb, var(--atl-ink) 7%, transparent); color: var(--atl-ink-dim); border-color: var(--atl-line-strong); }
+
+/* ── A rich-text editor (Quill, themed by css/overrides/quill.css) inside a field: the same edge and focus ring as an input ────── */
+.atl-drawer--dk .dk-field .atl-quill-wrap { border: 1px solid var(--atl-line-bold); border-radius: var(--atl-r-lg); }
+.atl-drawer--dk .dk-field .atl-quill-wrap:focus-within { border-color: var(--atl-focus); box-shadow: 0 0 0 3px var(--atl-focus-ring); }
+.atl-drawer--dk .dk-field .atl-quill-wrap .ql-editor { min-height: 220px; font-size: 14px; line-height: 1.55; }
+
+/* ── A drop zone: a real, keyboard-usable target for a file ───────────────────────────────────────────────────────────────────── */
+.dk-drop {
+    display: flex; flex-direction: column; align-items: center; gap: 10px; text-align: center; cursor: pointer;
+    padding: var(--atl-sp-lg) var(--atl-sp-md); background: var(--atl-paper); border: 2px dashed var(--atl-line-bold); border-radius: var(--atl-r-lg);
+    transition: border-color var(--atl-t-fast), background var(--atl-t-fast);
+}
+.dk-drop:hover, .dk-drop.is-over { border-color: var(--atl-amber); background: var(--atl-amber-dim); }
+.dk-drop:focus-visible { outline: 2px solid var(--atl-focus); outline-offset: 2px; }
+.dk-drop__icon { font-size: 30px; color: var(--atl-muted); }
+.dk-drop__text { margin: 0; font-size: 13px; color: var(--atl-ink-dim); }
+.dk-drop__hint { margin: 0; font-size: 12px; color: var(--atl-muted); }
+.dk-filechip {
+    display: flex; align-items: center; gap: 10px; width: 100%; padding: 10px var(--atl-sp-md); text-align: left;
+    background: var(--atl-card); border: 1px solid var(--atl-line-strong); border-radius: var(--atl-r-lg); font-size: 13px; color: var(--atl-ink);
+}
+.dk-filechip > i { color: var(--atl-clay); }
+.dk-filechip__size { color: var(--atl-muted); font-size: 12px; }
+.dk-filechip__clear { margin-left: auto; background: none; border: 0; padding: 6px 8px; color: var(--atl-muted); cursor: pointer; border-radius: var(--atl-r-md); font-size: 13px; }
+.dk-filechip__clear:hover { color: var(--atl-ink); background: color-mix(in srgb, var(--atl-ink) 6%, transparent); }
+
+/* ── A repeatable row: a select (+ an optional number) + a remove button (Manual Booking's services) ─────────────────────────────── */
+.dk-svc-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.dk-svc-row > select.atl-input { flex: 1 1 0; min-width: 0; width: auto !important; }
+.dk-svc-row > input.atl-input { flex: 0 0 120px; width: 120px !important; }
+.dk-svc-row > .atl-btn { flex: none; width: var(--atl-tap); height: var(--atl-tap) !important; min-height: var(--atl-tap) !important; padding: 0; display: inline-flex; align-items: center; justify-content: center; }   /* !important: the admin sets every button to 40px */
+
+/* ── Buttons row: equal widths, comfortable height, wraps on a narrow screen ─────────────────────────────────────────────────── */
+.dk-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: var(--atl-sp-sm); }
+.dk-actions .atl-btn, .atl-drawer--dk .atl-drawer__footer .atl-btn {
+    min-height: var(--atl-tap); display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+    padding: 8px 16px; font-size: 13px; border-radius: var(--atl-r-lg);
+}
+.dk-actions__primary { grid-column: 1 / -1; }
+.dk-actions .atl-btn:focus-visible, .atl-drawer--dk .atl-drawer__footer .atl-btn:focus-visible { outline: 2px solid var(--atl-focus); outline-offset: 2px; }
+
+/* ── Phone: single column facts, label above value ───────────────────────────────────────────────────────────────────────────── */
+@media (max-width: 480px) {
+    .dk-facts, .dk-facts--3 { grid-template-columns: minmax(0, 1fr); }
+    .dk-row { grid-template-columns: minmax(0, 1fr); row-gap: 2px; }
+    .dk-card__note { display: none; }
+    .dk-form { grid-template-columns: minmax(0, 1fr); }
+}
+@media (prefers-reduced-motion: reduce) { .dk-card__chev { transition: none; } }
+
+/* ── Light kit: a drawer with its own tabs and panels (Deal View) keeps its structure and gets the kit's finish ─────────────────────
+   Opt in with .atl-drawer--dk-lite (NOT --dk, which also re-lays the body out). What it adds: the round close button (above), card titles that read as titles,
+   and card edges in the kit's family. Every value is a token. Scoped to #dealViewDrawer because .atl-det-title/.atl-det-card are shared with the bookings
+   list, whose small eyebrow titles stay as they are. body.admin-body + the id beat redesign.css's h1-h6 !important font/colour (the heading bleed). */
+body.admin-body .atl-drawer--dk-lite .atl-det-title {
+    font-family: 'Outfit', sans-serif !important; font-size: 14px !important; font-weight: 700 !important; letter-spacing: 0 !important;
+    text-transform: none !important; color: var(--atl-ink) !important; margin-bottom: var(--atl-sp-md); gap: 10px;
+}
+body.admin-body .atl-drawer--dk-lite .atl-det-title i { width: 18px; text-align: center; font-size: 14px; }
+body.admin-body .atl-drawer--dk-lite .atl-det-title > span > i { margin-right: 10px; }   /* titles that wrap icon + label in a span (Overview cards): the title's own gap sits between the span and its Edit button */
+body.admin-body .atl-drawer--dk-lite .atl-det-card--cancel .atl-det-title { color: var(--atl-clay) !important; }
+.atl-drawer--dk-lite .atl-det-card { border: 1px solid var(--atl-line-strong); border-radius: var(--atl-r-lg); }
+.atl-drawer--dk-lite .dv-breadcrumb, .atl-drawer--dk-lite .dv-breadcrumb .cur { font-size: 12px; }
+
+/* Ticket drawers (Manage tickets, Ticket order) on the light kit: their section titles are .tkt-h, their stat tiles are the dashboard's .db-stat-card. */
+body.admin-body .atl-drawer--dk-lite .tkt-h {
+    font-family: 'Outfit', sans-serif !important; font-size: 14px !important; font-weight: 700 !important; letter-spacing: 0 !important;
+    text-transform: none !important; color: var(--atl-ink) !important;
+}
+.atl-drawer--dk-lite .tkt-panel { border-color: var(--atl-line-strong); border-radius: var(--atl-r-lg); }
+/* A stat tile inside a drawer is narrow: the icon goes above the text, the value stays on one line and the label wraps instead of being cut off ("GROSS TICKE...", "R" / "450,00") */
+.atl-drawer--dk-lite .db-stat-card { flex-direction: column !important; align-items: flex-start !important; gap: 10px; }
+.atl-drawer--dk-lite .db-stat-value { white-space: nowrap; font-size: 24px !important; }
+.atl-drawer--dk-lite .db-stat-label { white-space: normal !important; overflow: visible !important; text-overflow: clip !important; line-height: 1.35; }

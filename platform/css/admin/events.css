@@ -1,0 +1,61 @@
+/* Phase 6 (HOUSEKEEPING-NOTES.md): relocated from admin.html verbatim — the "EVENTS SECTION —
+   Card grid + editor dock" rules (.evt-* card grid/bulk-bar/badges/list-heading/editor-dock
+   styles for the Upcoming Events tab). The immediately-following ".atl-edit-card" block was
+   explicitly marked shared in its own comment ("isolated from booking/event JS hooks") and was
+   NOT moved — it stays in admin.html. #eventsAdmin also appears in a separate shared
+   15-section "no background" rule elsewhere in admin.html — also not moved. */
+
+/* ── EVENTS SECTION — Card grid + editor dock ── */
+@media (max-width:767px) {  }
+@media (max-width:575px) {
+    .evt-controls-row { flex-direction:column; align-items:stretch; }
+    .evt-controls-row .um-input-wrap { min-width:0; width:100%; }
+    .evt-bulk-bar { flex-direction:column; align-items:flex-start; gap:8px; }
+    .evt-bulk-bar > div { flex-wrap:wrap; }
+}
+@media (max-width:479px) {
+    #evtPosterPreview { max-height:140px !important; }
+}
+/* Accessible checkbox hit zone — 44×44px clickable area around 18px checkbox */
+.evt-select-cb-wrap { position:absolute; top:6px; left:6px; width:44px; height:44px; display:none; align-items:center; justify-content:center; cursor:pointer; z-index:10; }
+.evt-card-selectable .atl-event-card .evt-select-cb-wrap { display:flex !important; }
+.evt-select-cb-wrap .evt-select-cb { display:block; width:18px; height:18px; accent-color:var(--atl-amber); cursor:pointer; }
+.evt-controls-row { display:flex; gap:10px; align-items:center; margin-bottom:16px; flex-wrap:wrap; }
+.evt-bulk-bar {
+    display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+    background:var(--atl-surface2); border:1px solid var(--atl-line);
+    border-radius:var(--atl-r-md); padding:10px 14px; margin-bottom:16px;
+}
+.evt-bulk-count { font-size:13px; color:var(--atl-amber); font-weight:600; white-space:nowrap; }
+.evt-card-selectable .atl-event-card { position:relative; }
+.atl-event-card.evt-selected { outline:2px solid var(--atl-amber); outline-offset:2px; }
+
+/* Hide search/bulk controls when About tab is active */
+#eventsAdmin:has([data-um-tab="evtPanelAbout"].active) .evt-controls-row,
+#eventsAdmin:has([data-um-tab="evtPanelAbout"].active) #evtBulkBar {
+    display: none !important;
+}
+
+/* Unified event card badges (replaces all hardcoded inline badge styles) */
+.evt-badge { display:inline-flex; align-items:center; gap:4px; padding:2px 8px; border-radius:var(--atl-r-pill); font-family:'Outfit',sans-serif; font-size:10px; font-weight:700; line-height:1.4; white-space:nowrap; }
+.evt-badge--amber { background:var(--atl-amber-dim); color:var(--atl-amber); border:1px solid var(--atl-amber-border); }
+.evt-badge--amber-dim { background:var(--atl-amber-dim); color:var(--atl-amber); border:1px solid var(--atl-amber-border); }
+.evt-badge--muted { background:var(--atl-surface2); color:var(--atl-muted); border:1px solid var(--atl-line); }
+.evt-badge--blue { background:rgba(var(--atl-blue-rgb), 0.12); color:var(--atl-blue); border:1px solid rgba(var(--atl-blue-rgb), 0.25); }
+/* --atl-clay-dim is never defined anywhere in css/core/ - the rgba() fallback was permanently
+   active, not a fallback, so this never followed Finish. */
+.evt-badge--red { background:color-mix(in srgb, var(--atl-clay) 10%, transparent); color:var(--atl-clay,#ef4444); border:1px solid color-mix(in srgb, var(--atl-clay) 20%, transparent); }
+.evt-badge--warn { background:color-mix(in srgb, var(--atl-orange) 12%, transparent); color:var(--atl-orange); border:1px solid color-mix(in srgb, var(--atl-orange) 25%, transparent); }
+.evt-badge--danger { background:color-mix(in srgb, var(--atl-clay) 10%, transparent); color:var(--atl-clay,#ef4444); border:1px solid color-mix(in srgb, var(--atl-clay) 20%, transparent); }
+.evt-badge--sage { background:color-mix(in srgb, var(--atl-sage) 12%, transparent); color:var(--atl-sage); border:1px solid color-mix(in srgb, var(--atl-sage) 30%, transparent); }
+
+/* Card text hierarchy, matching the other .atl-edit-card sections: title=ink, description=House
+   accent (.atl-edit-card__subtitle already resolves to --atl-amber), date/venue=muted. */
+.evt-card-meta { color:var(--atl-muted); font-size:13px; font-weight:400; margin:0 0 4px; }
+.evt-form-action-btn { min-width:140px; justify-content:center; }
+#eventsDesc { min-height: 116px !important; }
+.evt-card-grid { display:flex; flex-direction:column; gap:16px; }
+@media (max-width:639px) {
+    #eventsFormHomeMount .um-form-grid { grid-template-columns:1fr !important; }
+    .atl-form-mount .um-form-grid { grid-template-columns:1fr !important; }
+}
