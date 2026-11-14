@@ -1,0 +1,3187 @@
+const sqlite3 = require('sqlite3').verbose();
+const path = require('path');
+const bcrypt = require('bcrypt');
+const crypto = require('crypto');
+const { normalizeEncodedText, decodeStoredText, sanitizeAboutHtml } = require('./lib/html-sanitize');
+
+// DB_PATH lets the integration tests point the whole app at a throwaway copy of the database
+// instead of the real database.sqlite. Production/dev leave it unset and use the repo-root file.
+const dbPath = process.env.DB_PATH
+    ? path.resolve(process.env.DB_PATH)
+    : path.resolve(__dirname, 'database.sqlite');
+const db = new sqlite3.Database(dbPath, (err) => {
+    if (err) {
+        console.error('Error opening database', err.message);
+    } else {
+        console.log('Connected to the SQLite database.');
+        initializeDatabase();
+    }
+});
+
+// Safety net: a db.run/get/all/each call made without an error callback (there are many, across
+// this file and the route/lib layers) still creates a Statement that emits 'error' on failure -
+// e.g. a SQLITE_BUSY lock timeout, or a migration ALTER hitting an unexpected schema. With zero
+// listeners, Node's EventEmitter treats that as fatal and kills the whole process (confirmed
+// live: a single lock contention during a background job crashed the entire server, taking down
+// every in-flight request, not just the one that hit the lock). node-sqlite3 re-emits a
+// Statement's unhandled error on its parent Database, so this one listener is a global catch-all
+// for every such site without having to audit each call individually. It does not fix whatever
+// underlying issue that caused the error - it converts an outage into a logged, non-fatal failure of
+// just that one operation, which is what should have happened in the first place.
+db.on('error', (err) => {
+    console.error('[db] Unhandled SQLite error on a callback-less statement (process kept alive):', err && err.message);
+});
+
+// One-time, idempotent repair of rich text (the admin's Quill editors) saved before it was exempted from entity-encoding
+// (RAW_HTML_BODY_FIELDS in app.js). It sits in the database as "&lt;p&gt;Hi&lt;/p&gt;", so a direct email was sent - and
+// a legal page shown - as literal tags. Real HTML always contains a "<"; a value with none but with "&lt;" is the
+// encoded form, so decode it back (and strip scripts/handlers the way the save routes now do). Touches nothing else.
+function repairEncodedRichText(table, column) {
+    db.all(`SELECT id, ${column} AS v FROM ${table} WHERE ${column} NOT LIKE '%<%' AND ${column} LIKE '%&lt;%'`, (selErr, rows) => {
+        if (selErr || !rows) return;
+        rows.forEach((r) => {
+            db.run(`UPDATE ${table} SET ${column} = ? WHERE id = ?`, [sanitizeAboutHtml(decodeStoredText(r.v)), r.id],
+                (e) => console.log(e ? '[migration] ' + table + '.' + column + ' rich-text repair failed for id ' + r.id + ': ' + e.message : '[migration] ' + table + ' id ' + r.id + ': restored HTML that had been saved entity-encoded'));
+        });
+    });
+}
+
+function initializeDatabase() {
+    db.serialize(() => {
+        // Enforce UTF-8 encoding and enable foreign keys
+        db.run("PRAGMA encoding = 'UTF-8';");
+        db.run('PRAGMA foreign_keys = ON;');
+        db.run("PRAGMA journal_mode = WAL;");
+        db.run("PRAGMA busy_timeout = 5000;");
+
+        // 1. Admins Table
+        db.run(`CREATE TABLE IF NOT EXISTS admins (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            email TEXT,
+            password_hash TEXT NOT NULL,
+            must_change_password INTEGER DEFAULT 0,
+            role TEXT DEFAULT 'manager',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            created_by INTEGER REFERENCES admins(id),
+            created_on DATETIME DEFAULT CURRENT_TIMESTAMP,
+            modified_by INTEGER REFERENCES admins(id),
+            modified_on DATETIME
+        )`, (err) => {
+            if (!err) {
+
+                // Ensure legacy columns exist
+                db.run("ALTER TABLE admins ADD COLUMN email TEXT", () => {
+                    db.run("UPDATE admins SET email = 'admin@culchar.example' WHERE username = 'admin' AND (email IS NULL OR email = '')", () => {});
+                });
+                db.run("ALTER TABLE admins ADD COLUMN must_change_password INTEGER DEFAULT 0", () => {});
+                db.run("ALTER TABLE admins ADD COLUMN role TEXT DEFAULT 'manager'", () => {
+                    db.run("UPDATE admins SET role = 'administrator' WHERE username = 'admin'", () => {});
+                });
+
+                // Comprehensive user management — profile/status fields.
+                db.run("ALTER TABLE admins ADD COLUMN full_name TEXT", () => {});
+                db.run("ALTER TABLE admins ADD COLUMN phone TEXT", () => {});
+                db.run("ALTER TABLE admins ADD COLUMN is_active INTEGER DEFAULT 1", () => {});
+                db.run("ALTER TABLE admins ADD COLUMN last_login_at DATETIME", () => {});
+                db.run("UPDATE admins SET is_active = 1 WHERE is_active IS NULL", () => {});
+
+                // Audit log fields for admin table
+                db.run("ALTER TABLE admins ADD COLUMN created_by INTEGER", () => {});
+                db.run("ALTER TABLE admins ADD COLUMN created_on DATETIME DEFAULT CURRENT_TIMESTAMP", () => {});
+                db.run("ALTER TABLE admins ADD COLUMN modified_by INTEGER", () => {});
+                db.run("ALTER TABLE admins ADD COLUMN modified_on DATETIME", () => {});
+
+                // Email is the login identifier — enforce uniqueness.
+                // Requires no duplicate/blank emails (pre-flight cleanup); logs + no-ops on failure.
+                db.run("CREATE UNIQUE INDEX IF NOT EXISTS idx_admins_email_unique ON admins(email)", (err) => {
+                    if (err) console.error('[migration] admins.email unique index failed — duplicate/blank emails remain:', err.message);
+                });
+            }
+        });
+
+        // 1.5. Password Reset Tokens Table
+        db.run(`CREATE TABLE IF NOT EXISTS password_reset_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_id INTEGER NOT NULL,
+            token_hash TEXT NOT NULL,
+            expires_at DATETIME NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (admin_id) REFERENCES admins (id) ON DELETE CASCADE
+        )`);
+
+        // 2. Inquiries Table (from Contact page)
+        db.run(`CREATE TABLE IF NOT EXISTS inquiries (
+            inquiry_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender_name TEXT NOT NULL,
+            sender_email TEXT NOT NULL,
+            receiver_email TEXT,
+            sender_phone TEXT,
+            category TEXT,
+            subject TEXT,
+            message_body TEXT NOT NULL,
+            status TEXT DEFAULT 'unread',
+            submitted_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            routing_path TEXT,
+            ip_address TEXT,
+            user_agent TEXT
+        )`, () => {
+            db.all("PRAGMA table_info(inquiries)", (err, columns) => {
+                if (err || !columns) return;
+                const colNames = columns.map(c => c.name);
+                
+                if (colNames.includes('id') && !colNames.includes('inquiry_id')) {
+                    // Try to migrate existing table
+                    db.serialize(() => {
+                        db.run("ALTER TABLE inquiries RENAME COLUMN id TO inquiry_id", function(err) {
+                            if (!err) {
+                                db.run("ALTER TABLE inquiries RENAME COLUMN name TO sender_name");
+                                db.run("ALTER TABLE inquiries RENAME COLUMN email TO sender_email");
+                                db.run("ALTER TABLE inquiries RENAME COLUMN cell TO sender_phone");
+                                db.run("ALTER TABLE inquiries RENAME COLUMN message TO message_body");
+                                db.run("ALTER TABLE inquiries RENAME COLUMN created_at TO submitted_at");
+                                db.run("ALTER TABLE inquiries ADD COLUMN receiver_email TEXT");
+                                db.run("ALTER TABLE inquiries ADD COLUMN category TEXT");
+                                db.run("ALTER TABLE inquiries ADD COLUMN routing_path TEXT");
+                                db.run("ALTER TABLE inquiries ADD COLUMN ip_address TEXT");
+                                db.run("ALTER TABLE inquiries ADD COLUMN user_agent TEXT");
+                            }
+                        });
+                    });
+                } else if (!colNames.includes('id') && colNames.includes('inquiry_id')) {
+                    // Ensure newer columns exist if somehow table was partially created
+                    if (!colNames.includes('receiver_email')) db.run("ALTER TABLE inquiries ADD COLUMN receiver_email TEXT", () => {});
+                    if (!colNames.includes('category')) db.run("ALTER TABLE inquiries ADD COLUMN category TEXT", () => {});
+                    if (!colNames.includes('routing_path')) db.run("ALTER TABLE inquiries ADD COLUMN routing_path TEXT", () => {});
+                    if (!colNames.includes('ip_address')) db.run("ALTER TABLE inquiries ADD COLUMN ip_address TEXT", () => {});
+                    if (!colNames.includes('user_agent')) db.run("ALTER TABLE inquiries ADD COLUMN user_agent TEXT", () => {});
+                    if (!colNames.includes('popia_consent')) db.run("ALTER TABLE inquiries ADD COLUMN popia_consent BOOLEAN DEFAULT 0", () => {});
+                    if (!colNames.includes('consent_timestamp')) db.run("ALTER TABLE inquiries ADD COLUMN consent_timestamp DATETIME", () => {});
+                }
+            });
+        });
+
+        // Added synchronously (not inside the async PRAGMA callback above) and BEFORE any index/trigger
+        // that references these columns, ignoring the "duplicate column" error on repeat boots — same
+        // pattern used for contracts.signed_by etc. below. A column added only inside that async PRAGMA
+        // callback isn't guaranteed to exist yet when a same-tick, synchronously-queued CREATE INDEX or
+        // CREATE TRIGGER elsewhere in this file references it (SQLite validates column references at
+        // trigger-creation time), which is exactly the race that broke chk/audit_inquiries_* on first boot.
+        db.run("ALTER TABLE inquiries ADD COLUMN assigned_to INTEGER REFERENCES admins(id) ON DELETE SET NULL", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: inquiries.assigned_to already exists or error: " + err.message); });
+        db.run("ALTER TABLE inquiries ADD COLUMN assigned_at DATETIME", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: inquiries.assigned_at already exists or error: " + err.message); });
+        db.run("ALTER TABLE inquiries ADD COLUMN priority TEXT DEFAULT 'normal'", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: inquiries.priority already exists or error: " + err.message); });
+        db.run("ALTER TABLE inquiries ADD COLUMN converted_booking_id INTEGER REFERENCES bookings(id) ON DELETE SET NULL", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: inquiries.converted_booking_id already exists or error: " + err.message); });
+        db.run("ALTER TABLE inquiries ADD COLUMN responded_at DATETIME", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: inquiries.responded_at already exists or error: " + err.message); });
+        // "Last Updated By" feature: inquiries previously had zero generic tracking (only submitted_at).
+        // updated_by_role is a snapshot of the admin's role at the time of the edit, set alongside
+        // updated_by in the same UPDATE statement, read by the extended audit_inquiries_update trigger
+        // below into audit_log.actor_role.
+        db.run("ALTER TABLE inquiries ADD COLUMN updated_by INTEGER REFERENCES admins(id)", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: inquiries.updated_by already exists or error: " + err.message); });
+        db.run("ALTER TABLE inquiries ADD COLUMN updated_at DATETIME", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: inquiries.updated_at already exists or error: " + err.message); });
+        db.run("ALTER TABLE inquiries ADD COLUMN updated_by_role TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: inquiries.updated_by_role already exists or error: " + err.message); });
+        // Where the inquiry came from: 'web_form' (the Contact section; also what NULL on older rows means) or 'email' (a message that reached the
+        // booking mailbox with no inquiry to attach to - see lib/inbox-sync.js).
+        db.run("ALTER TABLE inquiries ADD COLUMN source TEXT DEFAULT 'web_form'", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: inquiries.source already exists or error: " + err.message); });
+
+        db.run(`CREATE INDEX IF NOT EXISTS idx_inquiries_status ON inquiries(status)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_inquiries_submitted_at ON inquiries(submitted_at)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_inquiries_assigned_to ON inquiries(assigned_to)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_inquiries_priority ON inquiries(priority)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_inquiries_converted_booking_id ON inquiries(converted_booking_id)`);
+
+        // 3. Bookings Table (from Booking page)
+        db.run(`CREATE TABLE IF NOT EXISTS bookings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            company TEXT,
+            email TEXT NOT NULL,
+            cell TEXT NOT NULL,
+            event_name TEXT,
+            date TEXT NOT NULL,
+            event_start_time TEXT,
+            performance_slot TEXT,
+            performance_duration TEXT,
+            event_location TEXT NOT NULL,
+            venue_address TEXT,
+            city TEXT,
+            country TEXT,
+            venue_type TEXT,
+            event_type TEXT NOT NULL,
+            audience_size TEXT,
+            audience_demographic TEXT,
+            budget_range TEXT,
+            travel_accommodation BOOLEAN DEFAULT 0,
+            message TEXT NOT NULL,
+            status TEXT DEFAULT 'NEW',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            quote_amount TEXT,
+            quote_details TEXT,
+            quote_expiry_date TEXT,
+            payment_status TEXT DEFAULT 'UNPAID',
+            total_amount REAL,
+            amount_paid REAL DEFAULT 0,
+            amount_outstanding REAL,
+            last_payment_date DATETIME,
+            payment_date DATETIME,
+            quoted_at DATETIME,
+            accepted_at DATETIME,
+            confirmed_at DATETIME,
+            completed_at DATETIME,
+            cancelled_at DATETIME,
+            policy_version TEXT
+        )`);
+        // Failsafe schema updates in case the table was already created. Added synchronously
+        // (not nested inside the CREATE TABLE's completion callback) and BEFORE any index/trigger
+        // that references these columns — same reasoning as the inquiries.assigned_to fix above:
+        // a column added only inside a nested async callback isn't guaranteed to exist yet when a
+        // same-tick, synchronously-queued statement elsewhere in this file needs it (this exact race
+        // crashed a fresh boot via the audit_bookings_update trigger's OLD.is_public/NEW.is_public
+        // reference, since is_public used to only exist by the time this callback got around to it).
+        db.run("ALTER TABLE bookings ADD COLUMN status TEXT DEFAULT 'NEW'", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN company TEXT", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN event_name TEXT", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN event_start_time TEXT", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN performance_slot TEXT", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN performance_duration TEXT", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN event_location TEXT NOT NULL DEFAULT 'TBD'", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN venue_address TEXT", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN city TEXT", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN country TEXT", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN venue_type TEXT", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN audience_size TEXT", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN audience_demographic TEXT", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN budget_range TEXT", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN travel_accommodation BOOLEAN DEFAULT 0", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN quote_amount TEXT", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN quote_details TEXT", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN quote_expiry_date TEXT", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN payment_status TEXT DEFAULT 'UNPAID'", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN payment_date DATETIME", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN quoted_at DATETIME", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN accepted_at DATETIME", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN confirmed_at DATETIME", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN completed_at DATETIME", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN cancelled_at DATETIME", () => {});
+        // PayFast payment audit columns
+        db.run("ALTER TABLE bookings ADD COLUMN payment_amount TEXT", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN payment_reference TEXT", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN payment_signature TEXT", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN payment_raw_data TEXT", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN payment_method TEXT", () => {});
+
+        // Decimal ledger migration
+        db.run("ALTER TABLE bookings ADD COLUMN total_amount REAL", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN amount_paid REAL DEFAULT 0", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN amount_outstanding REAL", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN last_payment_date DATETIME", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN popia_consent BOOLEAN DEFAULT 0", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN consent_timestamp DATETIME", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN is_public INTEGER DEFAULT 0", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN ticket_link TEXT", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN policy_version TEXT", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN source TEXT", () => {});
+        db.run("ALTER TABLE bookings ADD COLUMN referrer TEXT", () => {});
+
+        db.run("CREATE INDEX IF NOT EXISTS idx_bookings_date ON bookings(date)", () => {});
+        db.run("CREATE INDEX IF NOT EXISTS idx_bookings_status ON bookings(status)", () => {});
+        db.run("CREATE INDEX IF NOT EXISTS idx_bookings_date_status ON bookings(date, status)", () => {});
+
+        // 3.5 Payment Audit Logs Table
+        db.run(`CREATE TABLE IF NOT EXISTS payment_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            booking_id INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            raw_payload TEXT,
+            signature_valid BOOLEAN,
+            amount REAL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(booking_id) REFERENCES bookings(id)
+        )`);
+
+        // 4. Newsletter Subscribers Table
+        db.run(`CREATE TABLE IF NOT EXISTS newsletter_subscribers (
+            subscriber_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            status TEXT DEFAULT 'active',
+            subscribed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            created_on DATETIME DEFAULT CURRENT_TIMESTAMP,
+            created_by INTEGER,
+            modified_on DATETIME,
+            modified_by INTEGER,
+            ip_address TEXT,
+            user_agent TEXT,
+            source TEXT,
+            policy_version TEXT
+        )`, () => {
+            // Apply fallback migrations if the legacy string "id" or "active" columns are found or missing fields
+            db.all("PRAGMA table_info(newsletter_subscribers)", (err, columns) => {
+                if (err || !columns) return;
+                const colNames = columns.map(c => c.name);
+                
+                // If old schema existed
+                if (colNames.includes('id') && !colNames.includes('subscriber_id')) {
+                    db.serialize(() => {
+                        db.run("ALTER TABLE newsletter_subscribers RENAME COLUMN id TO subscriber_id", () => {
+                            if (!colNames.includes('status')) {
+                                db.run("ALTER TABLE newsletter_subscribers ADD COLUMN status TEXT DEFAULT 'active'", () => {
+                                    if (colNames.includes('active')) {
+                                        db.run("UPDATE newsletter_subscribers SET status = CASE WHEN active = 1 THEN 'active' ELSE 'inactive' END", () => {});
+                                    }
+                                });
+                            }
+                            if (!colNames.includes('created_on')) db.run("ALTER TABLE newsletter_subscribers ADD COLUMN created_on DATETIME DEFAULT CURRENT_TIMESTAMP", () => {});
+                            if (!colNames.includes('created_by')) db.run("ALTER TABLE newsletter_subscribers ADD COLUMN created_by INTEGER", () => {});
+                            if (!colNames.includes('modified_on')) db.run("ALTER TABLE newsletter_subscribers ADD COLUMN modified_on DATETIME", () => {});
+                            if (!colNames.includes('modified_by')) db.run("ALTER TABLE newsletter_subscribers ADD COLUMN modified_by INTEGER", () => {});
+                            if (!colNames.includes('ip_address')) db.run("ALTER TABLE newsletter_subscribers ADD COLUMN ip_address TEXT", () => {});
+                            if (!colNames.includes('user_agent')) db.run("ALTER TABLE newsletter_subscribers ADD COLUMN user_agent TEXT", () => {});
+                            if (!colNames.includes('source')) db.run("ALTER TABLE newsletter_subscribers ADD COLUMN source TEXT", () => {});
+                            if (!colNames.includes('policy_version')) db.run("ALTER TABLE newsletter_subscribers ADD COLUMN policy_version TEXT", () => {});
+                        });
+                    });
+                } else if (!colNames.includes('id') && colNames.includes('subscriber_id')) {
+                    // It's the new schema or already renamed - ensure columns exist just in case
+                    if (!colNames.includes('status')) db.run("ALTER TABLE newsletter_subscribers ADD COLUMN status TEXT DEFAULT 'active'", () => {});
+                    if (!colNames.includes('created_on')) db.run("ALTER TABLE newsletter_subscribers ADD COLUMN created_on DATETIME DEFAULT CURRENT_TIMESTAMP", () => {});
+                    if (!colNames.includes('created_by')) db.run("ALTER TABLE newsletter_subscribers ADD COLUMN created_by INTEGER", () => {});
+                    if (!colNames.includes('modified_on')) db.run("ALTER TABLE newsletter_subscribers ADD COLUMN modified_on DATETIME", () => {});
+                    if (!colNames.includes('modified_by')) db.run("ALTER TABLE newsletter_subscribers ADD COLUMN modified_by INTEGER", () => {});
+                    if (!colNames.includes('ip_address')) db.run("ALTER TABLE newsletter_subscribers ADD COLUMN ip_address TEXT", () => {});
+                    if (!colNames.includes('user_agent')) db.run("ALTER TABLE newsletter_subscribers ADD COLUMN user_agent TEXT", () => {});
+                    if (!colNames.includes('source')) db.run("ALTER TABLE newsletter_subscribers ADD COLUMN source TEXT", () => {});
+                    if (!colNames.includes('popia_consent')) db.run("ALTER TABLE newsletter_subscribers ADD COLUMN popia_consent BOOLEAN DEFAULT 0", () => {});
+                    if (!colNames.includes('consent_timestamp')) db.run("ALTER TABLE newsletter_subscribers ADD COLUMN consent_timestamp DATETIME", () => {});
+                    if (!colNames.includes('policy_version')) db.run("ALTER TABLE newsletter_subscribers ADD COLUMN policy_version TEXT", () => {});
+                }
+            });
+        });
+
+        // 5. Newsletter Campaigns Table
+        db.run(`CREATE TABLE IF NOT EXISTS newsletter_campaigns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subject TEXT NOT NULL,
+            content TEXT NOT NULL,
+            sent_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`);
+
+        // 5.5 Newsletter Drafts Table
+        db.run(`CREATE TABLE IF NOT EXISTS newsletter_drafts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subject TEXT,
+            content TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`);
+
+        // 5.6 Scheduled Newsletters Table
+        db.run(`CREATE TABLE IF NOT EXISTS scheduled_newsletters (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subject TEXT,
+            content TEXT NOT NULL,
+            scheduled_at DATETIME NOT NULL,
+            status TEXT DEFAULT 'pending',
+            attachment_paths TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`);
+        // Migration: add attachment_paths for existing databases (silently ignored if already present)
+        db.run("ALTER TABLE scheduled_newsletters ADD COLUMN attachment_paths TEXT", () => {});
+
+        // 6. Career Highlights Table
+        db.run(`CREATE TABLE IF NOT EXISTS career_highlights (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            year TEXT,
+            title TEXT NOT NULL,
+            badge TEXT,
+            location TEXT,
+            description TEXT NOT NULL,
+            image_path TEXT,
+            display_order INTEGER DEFAULT 0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`, () => {
+            // Failsafe schema updates in case the table was already created
+            db.run("ALTER TABLE career_highlights ADD COLUMN year TEXT", () => {});
+            db.run("ALTER TABLE career_highlights ADD COLUMN badge TEXT", () => {});
+            db.run("ALTER TABLE career_highlights ADD COLUMN location TEXT", () => {});
+            // Milestones redesign: per-entry icon badge (mic/tv/plane/etc.) — nullable, falls back
+            // to a generic icon on the frontend for existing rows.
+            db.run("ALTER TABLE career_highlights ADD COLUMN icon TEXT", () => {});
+            // One-time repair, idempotent (it only touches rows whose text carries stacked entity layers):
+            // the admin editor used to load the stored, already-encoded text back into its form boxes, so every
+            // edit of a title/description containing & " ' encoded it again - "&amp;amp;quot;Celeste..." showed
+            // on the public page. Collapse them to the single-layer form deepEscapeBody stores.
+            db.all("SELECT id, title, badge, location, description FROM career_highlights", (selErr, rows) => {
+                if (selErr || !rows) return;
+                rows.forEach((r) => {
+                    const fixed = [r.title, r.badge, r.location, r.description].map(normalizeEncodedText);
+                    if (fixed[0] === r.title && fixed[1] === r.badge && fixed[2] === r.location && fixed[3] === r.description) return;
+                    db.run("UPDATE career_highlights SET title = ?, badge = ?, location = ?, description = ? WHERE id = ?",
+                        [fixed[0], fixed[1], fixed[2], fixed[3], r.id],
+                        (e) => console.log(e ? '[migration] career_highlights text repair failed for id ' + r.id + ': ' + e.message : '[migration] career_highlights id ' + r.id + ': collapsed stacked HTML-entity encoding'));
+                });
+            });
+        });
+
+        // Footprint — countries performed in, shown as a flag grid on the public site.
+        // Modeled directly on career_highlights: same admin-managed list shape, no reorder UI.
+        db.run(`CREATE TABLE IF NOT EXISTS footprint_countries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            country_name TEXT NOT NULL,
+            flag_image_path TEXT NOT NULL,
+            display_order INTEGER DEFAULT 0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`, () => {
+            // One-time seed of the real countries from the Footprint prototype — only runs while
+            // the table is empty, so an admin who later deletes all rows doesn't get them back.
+            db.get("SELECT COUNT(*) AS c FROM footprint_countries", (err, row) => {
+                if (err || !row || row.c > 0) return;
+                const seed = [
+                    ['South Africa', 'images/footprint/flag-south-africa.png'],
+                    ['Eswatini', 'images/footprint/flag-eswatini.png'],
+                    ['Lesotho', 'images/footprint/flag-lesotho.png'],
+                    ['Cape Verde', 'images/footprint/flag-cape-verde.png'],
+                    ['Spain', 'images/footprint/flag-spain.png'],
+                    ['Japan', 'images/footprint/flag-japan.png'],
+                ];
+                seed.forEach(([country_name, flag_image_path]) => {
+                    db.run("INSERT INTO footprint_countries (country_name, flag_image_path) VALUES (?, ?)", [country_name, flag_image_path]);
+                });
+            });
+        });
+
+        // Testimonials — visitor-submitted, admin-moderated. status gates public visibility;
+        // no CHECK constraint, matching this project's established preference for status columns
+        // (see the Newsletter double opt-in work for the same reasoning).
+        db.run(`CREATE TABLE IF NOT EXISTS testimonials (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            designation TEXT,
+            quote TEXT NOT NULL,
+            image_path TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            submitted_by TEXT NOT NULL DEFAULT 'visitor',
+            display_order INTEGER DEFAULT 0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`, () => {
+            // One-time seed of the real testimonial quotes from the prototype, pre-approved since
+            // they're the site owner's own vetted content. NOTE: the prototype's embedded "photos"
+            // turned out to be unrelated event flyers, not real client headshots — seeded with
+            // image_path NULL on purpose; the public carousel renders a monogram avatar for any
+            // testimonial without a photo (real client photos can be added via the admin later).
+            db.get("SELECT COUNT(*) AS c FROM testimonials", (err, row) => {
+                if (err || !row || row.c > 0) return;
+                const seed = [
+                    ['Naledi Khumalo', 'Corporate Events Lead', "CulChar hosted our year-end function and had the whole floor, from interns to the CFO, crying with laughter. Professional, punctual, and impossibly funny."],
+                    ['Sipho Maseko', 'Festival Director', "He switched between isiSwati and English mid-punchline and somehow the whole tent got the joke. We've booked him twice since. The crowd asks for him by name."],
+                    ['Annelie Botha', 'Private Client', "From the first quote to the final bow, everything was effortless. He made my father's 60th feel like a sold-out theatre show."],
+                ];
+                seed.forEach(([name, designation, quote]) => {
+                    db.run("INSERT INTO testimonials (name, designation, quote, status, submitted_by) VALUES (?, ?, ?, 'approved', 'admin')", [name, designation, quote]);
+                });
+            });
+        });
+
+        // 7. Gallery Images Table
+        db.run(`CREATE TABLE IF NOT EXISTS gallery_images (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            image_path TEXT NOT NULL,
+            uploader_name TEXT,
+            location TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`, () => {
+            db.all("PRAGMA table_info(gallery_images)", (err, columns) => {
+                if (err || !columns) return;
+                const colNames = columns.map(c => c.name);
+                if (!colNames.includes('uploader_name')) db.run("ALTER TABLE gallery_images ADD COLUMN uploader_name TEXT", () => {});
+                if (!colNames.includes('location')) db.run("ALTER TABLE gallery_images ADD COLUMN location TEXT", () => {});
+                // "Last Updated By" feature: gallery_images has no existing audit trigger (its CRUD routes
+                // wrote zero audit_log rows before this), so role is passed straight into the explicit
+                // logAudit() insert at write time — no scratch role column needed here, unlike the
+                // trigger-covered tables above.
+                if (!colNames.includes('created_by')) db.run("ALTER TABLE gallery_images ADD COLUMN created_by INTEGER REFERENCES admins(id)", () => {});
+                if (!colNames.includes('updated_by')) db.run("ALTER TABLE gallery_images ADD COLUMN updated_by INTEGER REFERENCES admins(id)", () => {});
+                if (!colNames.includes('updated_at')) db.run("ALTER TABLE gallery_images ADD COLUMN updated_at DATETIME", () => {});
+                // Drag-to-reorder in the admin Gallery grid (mirrors home_slider.display_order).
+                if (!colNames.includes('display_order')) db.run("ALTER TABLE gallery_images ADD COLUMN display_order INTEGER DEFAULT 0", () => {});
+            });
+        });
+
+        // 7b. Management Team Table — Management Team feature. New table (no ALTER-guard dance
+        // needed, unlike gallery_images above, since every column ships in the initial CREATE).
+        // Social links are flat columns (not a JSON blob) to match the explicit field list the
+        // feature was specced against; adding another platform later is the same guarded-ALTER
+        // idiom used everywhere else in this file, not a restructuring.
+        db.run(`CREATE TABLE IF NOT EXISTS team_members (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            role TEXT,
+            biography TEXT,
+            image_path TEXT,
+            email TEXT,
+            phone TEXT,
+            website TEXT,
+            twitter TEXT,
+            linkedin TEXT,
+            instagram TEXT,
+            behance TEXT,
+            display_order INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'active',
+            featured INTEGER DEFAULT 0,
+            created_by INTEGER REFERENCES admins(id),
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_by INTEGER REFERENCES admins(id),
+            updated_at DATETIME
+        )`, () => {});
+
+        // 7c. Accolades & Recognition — EXTERNAL recognition (wins, nominations, honours). Kept apart
+        // from career_highlights on purpose: Milestones are the career journey, this is what others
+        // awarded. Rules (categories, validation, ordering, what is published) live in
+        // lib/accolades.js, not here — no CHECK constraints, matching the status-column preference
+        // noted on testimonials above. status defaults to 'inactive' so a row that reaches the table
+        // any other way than the admin form is never published by accident.
+        db.run(`CREATE TABLE IF NOT EXISTS accolades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            category TEXT NOT NULL,
+            year INTEGER NOT NULL,
+            achievement_date TEXT,
+            organisation TEXT,
+            event_name TEXT,
+            result TEXT,
+            description TEXT,
+            location TEXT,
+            image TEXT,
+            organisation_logo TEXT,
+            certificate_file TEXT,
+            external_url TEXT,
+            source_url TEXT,
+            featured INTEGER DEFAULT 0,
+            display_order INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'inactive',
+            created_by INTEGER REFERENCES admins(id),
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_by INTEGER REFERENCES admins(id),
+            updated_at DATETIME
+        )`, () => {
+            // One record per award: the same title + category + year + organisation (case-insensitive)
+            // cannot be stored twice. Backstop for the friendlier 409 check in routes/admin/accolades.js
+            // — this index is what stops two simultaneous submissions both getting through.
+            db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_accolades_identity
+                    ON accolades (lower(title), category, year, lower(COALESCE(organisation, '')))`, () => {});
+        });
+
+         // 8. Manager Details Table
+        db.run(`CREATE TABLE IF NOT EXISTS manager_details (
+            manager_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            cell_number TEXT NOT NULL,
+            whatsapp_number TEXT NOT NULL,
+            email TEXT NOT NULL,
+            whatsapp_link TEXT,
+            created_on DATETIME DEFAULT CURRENT_TIMESTAMP,
+            created_by INTEGER,
+            modified_on DATETIME,
+            modified_by INTEGER,
+            FOREIGN KEY (created_by) REFERENCES admins (id),
+            FOREIGN KEY (modified_by) REFERENCES admins (id)
+        )`, () => {
+             db.run("ALTER TABLE manager_details ADD COLUMN whatsapp_link TEXT", () => {});
+             db.get("SELECT COUNT(*) AS count FROM manager_details", (err, row) => {
+                 if (row && row.count === 0) {
+                     db.run(`INSERT INTO manager_details (name, cell_number, whatsapp_number, email) 
+                             VALUES ('Manager Name', '+27 82 123 4567', '+27 82 123 9876', 'hello@culchar.example')`, (err) => {
+                         if (!err) console.log('Default manager details seeded.');
+                     });
+                 }
+             });
+        });
+
+        // 9. Contact Info Table (Quote, Signature, Target Email)
+        db.run(`CREATE TABLE IF NOT EXISTS contact_info (
+            quote_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            quote TEXT NOT NULL,
+            signature TEXT NOT NULL,
+            email TEXT NOT NULL,
+            created_on DATETIME DEFAULT CURRENT_TIMESTAMP,
+            created_by INTEGER,
+            modified_on DATETIME,
+            modified_by INTEGER
+        )`, () => {
+             db.get("SELECT COUNT(*) AS count FROM contact_info", (err, row) => {
+                 if (row && row.count === 0) {
+                     db.run(`INSERT INTO contact_info (quote, signature, email) 
+                             VALUES ('I’m here to redefine comedy.', 'CulChar', 'admin@culchar.example')`, (err) => {
+                         if (!err) console.log('Default contact info seeded.');
+                     });
+                 }
+             });
+        });
+
+        // 10. Events Table
+        db.run(`CREATE TABLE IF NOT EXISTS events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_title TEXT NOT NULL,
+            event_description TEXT,
+            event_datetime TEXT,
+            venue_name TEXT,
+            venue_map_link TEXT,
+            ticket_sales_link TEXT,
+            poster_image_path TEXT,
+            event_status TEXT DEFAULT 'upcoming',
+            created_on DATETIME DEFAULT CURRENT_TIMESTAMP,
+            created_by INTEGER,
+            modified_on DATETIME,
+            modified_by INTEGER,
+            ip_address TEXT,
+            user_agent TEXT,
+            google_calendar_event_id TEXT,
+            FOREIGN KEY (created_by) REFERENCES admins (id),
+            FOREIGN KEY (modified_by) REFERENCES admins (id)
+        )`, () => {
+            // Apply migrations just in case table exists and doesn't have these
+            db.all("PRAGMA table_info(events)", (err, columns) => {
+                if (err || !columns) return;
+                const colNames = columns.map(c => c.name);
+                if (!colNames.includes('venue_map_link')) db.run("ALTER TABLE events ADD COLUMN venue_map_link TEXT", () => {});
+                if (!colNames.includes('ticket_sales_link')) db.run("ALTER TABLE events ADD COLUMN ticket_sales_link TEXT", () => {});
+                if (!colNames.includes('ip_address')) db.run("ALTER TABLE events ADD COLUMN ip_address TEXT", () => {});
+                if (!colNames.includes('user_agent')) db.run("ALTER TABLE events ADD COLUMN user_agent TEXT", () => {});
+                if (!colNames.includes('google_calendar_event_id')) db.run("ALTER TABLE events ADD COLUMN google_calendar_event_id TEXT", () => {});
+                // "Last Updated By" feature: modified_by already exists and works — modified_by_role is the
+                // new role-at-time-of-edit snapshot, set alongside modified_by by the edit route and read by
+                // the extended audit_events_update trigger below into audit_log.actor_role.
+                if (!colNames.includes('modified_by_role')) db.run("ALTER TABLE events ADD COLUMN modified_by_role TEXT", () => {});
+            });
+        });
+        
+        // 11. Social Links Table
+        db.run(`CREATE TABLE IF NOT EXISTS social_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            platform_name TEXT NOT NULL,
+            platform_url TEXT NOT NULL,
+            icon_class TEXT,
+            display_order INTEGER DEFAULT 0,
+            is_active BOOLEAN DEFAULT 1,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            created_by INTEGER,
+            modified_at DATETIME,
+            modified_by INTEGER,
+            ip_address TEXT,
+            user_agent TEXT,
+            routing_path TEXT,
+            FOREIGN KEY (created_by) REFERENCES admins (id),
+            FOREIGN KEY (modified_by) REFERENCES admins (id)
+        )`, () => {
+            db.all("PRAGMA table_info(social_links)", (err, columns) => {
+                if (err || !columns) return;
+                const colNames = columns.map(c => c.name);
+                
+                if (colNames.includes('name') && !colNames.includes('platform_name')) db.run("ALTER TABLE social_links RENAME COLUMN name TO platform_name", () => {});
+                if (colNames.includes('url') && !colNames.includes('platform_url')) db.run("ALTER TABLE social_links RENAME COLUMN url TO platform_url", () => {});
+                
+                if (!colNames.includes('is_active')) db.run("ALTER TABLE social_links ADD COLUMN is_active BOOLEAN DEFAULT 1", () => {});
+                if (!colNames.includes('created_by')) db.run("ALTER TABLE social_links ADD COLUMN created_by INTEGER", () => {});
+                if (!colNames.includes('modified_at')) db.run("ALTER TABLE social_links ADD COLUMN modified_at DATETIME", () => {});
+                if (!colNames.includes('modified_by')) db.run("ALTER TABLE social_links ADD COLUMN modified_by INTEGER", () => {});
+                if (!colNames.includes('ip_address')) db.run("ALTER TABLE social_links ADD COLUMN ip_address TEXT", () => {});
+                if (!colNames.includes('user_agent')) db.run("ALTER TABLE social_links ADD COLUMN user_agent TEXT", () => {});
+                if (!colNames.includes('routing_path')) db.run("ALTER TABLE social_links ADD COLUMN routing_path TEXT", () => {});
+            });
+        });
+
+        // 12. Social Embeds Table
+        db.run(`CREATE TABLE IF NOT EXISTS social_embeds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            platform_name TEXT NOT NULL,
+            embed_code TEXT NOT NULL,
+            platform_api_key TEXT,
+            metadata TEXT,
+            display_order INTEGER DEFAULT 0,
+            is_active BOOLEAN DEFAULT 1,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            created_by INTEGER,
+            modified_at DATETIME,
+            modified_by INTEGER,
+            ip_address TEXT,
+            user_agent TEXT,
+            routing_path TEXT,
+            FOREIGN KEY (created_by) REFERENCES admins (id),
+            FOREIGN KEY (modified_by) REFERENCES admins (id)
+        )`, () => {
+            db.all("PRAGMA table_info(social_embeds)", (err, columns) => {
+                if (err || !columns) return;
+                const colNames = columns.map(c => c.name);
+                
+                if (colNames.includes('platform') && !colNames.includes('platform_name')) db.run("ALTER TABLE social_embeds RENAME COLUMN platform TO platform_name", () => {});
+                if (colNames.includes('url') && !colNames.includes('embed_code')) db.run("ALTER TABLE social_embeds RENAME COLUMN url TO embed_code", () => {});
+                if (colNames.includes('metadata_json') && !colNames.includes('metadata')) db.run("ALTER TABLE social_embeds RENAME COLUMN metadata_json TO metadata", () => {});
+                
+                if (!colNames.includes('platform_api_key')) db.run("ALTER TABLE social_embeds ADD COLUMN platform_api_key TEXT", () => {});
+                if (!colNames.includes('is_active')) db.run("ALTER TABLE social_embeds ADD COLUMN is_active BOOLEAN DEFAULT 1", () => {});
+                if (!colNames.includes('created_by')) db.run("ALTER TABLE social_embeds ADD COLUMN created_by INTEGER", () => {});
+                if (!colNames.includes('modified_at')) db.run("ALTER TABLE social_embeds ADD COLUMN modified_at DATETIME", () => {});
+                if (!colNames.includes('modified_by')) db.run("ALTER TABLE social_embeds ADD COLUMN modified_by INTEGER", () => {});
+                if (!colNames.includes('ip_address')) db.run("ALTER TABLE social_embeds ADD COLUMN ip_address TEXT", () => {});
+                if (!colNames.includes('user_agent')) db.run("ALTER TABLE social_embeds ADD COLUMN user_agent TEXT", () => {});
+                if (!colNames.includes('routing_path')) db.run("ALTER TABLE social_embeds ADD COLUMN routing_path TEXT", () => {});
+            });
+        });
+        
+        // 12b. Social KPI Stats Table (cache and manual override values for dashboard KPI cards)
+        db.run(`CREATE TABLE IF NOT EXISTS social_kpi_stats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            platform_name TEXT NOT NULL UNIQUE,
+            follower_count INTEGER DEFAULT 0,
+            like_count INTEGER DEFAULT 0,
+            trend_percentage REAL DEFAULT 0,
+            trend_direction TEXT DEFAULT 'up',
+            manual_override BOOLEAN DEFAULT 1,
+            goal_target INTEGER DEFAULT 0,
+            last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`, () => {
+             // Default progress-bar goals per platform (previously hardcoded in the dashboard JS).
+             const defaultGoals = { 'Facebook': 20000, 'Instagram': 25000, 'X (Twitter)': 20000, 'YouTube': 25000, 'TikTok': 100000 };
+
+             // Migration: add goal_target to existing DBs and backfill sensible defaults once.
+             db.all("PRAGMA table_info(social_kpi_stats)", (err, columns) => {
+                 if (err || !columns) return;
+                 const colNames = columns.map(c => c.name);
+                 if (!colNames.includes('goal_target')) {
+                     db.run("ALTER TABLE social_kpi_stats ADD COLUMN goal_target INTEGER DEFAULT 0", () => {
+                         Object.keys(defaultGoals).forEach(p => {
+                             db.run("UPDATE social_kpi_stats SET goal_target = ? WHERE platform_name = ?", [defaultGoals[p], p], () => {});
+                         });
+                     });
+                 }
+             });
+
+             db.get("SELECT COUNT(*) AS count FROM social_kpi_stats", (err, row) => {
+                 if (row && row.count === 0) {
+                     const defaultKPIs = [
+                         ['Facebook', 12098, 12098, 22.9, 'up', 1, defaultGoals['Facebook']],
+                         ['Instagram', 15080, 0, -27.4, 'down', 1, defaultGoals['Instagram']],
+                         ['X (Twitter)', 12564, 0, 76.10, 'up', 1, defaultGoals['X (Twitter)']],
+                         ['YouTube', 14890, 0, 62.08, 'up', 1, defaultGoals['YouTube']],
+                         ['TikTok', 50230, 0, 120.5, 'up', 1, defaultGoals['TikTok']]
+                     ];
+                     const stmt = db.prepare("INSERT INTO social_kpi_stats (platform_name, follower_count, like_count, trend_percentage, trend_direction, manual_override, goal_target) VALUES (?, ?, ?, ?, ?, ?, ?)");
+                     defaultKPIs.forEach(kpi => stmt.run(kpi));
+                     stmt.finalize();
+                     console.log('Default Social Media KPI items seeded.');
+                 }
+             });
+        });
+
+        // 13. Email Audit Logs Table (Modernization Phase 3+)
+        db.run(`CREATE TABLE IF NOT EXISTS email_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            recipient_email TEXT NOT NULL,
+            subject TEXT,
+            trigger_event TEXT,
+            status TEXT DEFAULT 'success',
+            error_message TEXT,
+            sent_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`, () => {
+             db.all("PRAGMA table_info(email_logs)", (err, columns) => {
+                if (err || !columns) return;
+                const colNames = columns.map(c => c.name);
+                if (!colNames.includes('error_message')) db.run("ALTER TABLE email_logs ADD COLUMN error_message TEXT", () => {});
+                if (!colNames.includes('trigger_event')) db.run("ALTER TABLE email_logs ADD COLUMN trigger_event TEXT", () => {});
+                if (!colNames.includes('smtp_response')) db.run("ALTER TABLE email_logs ADD COLUMN smtp_response TEXT", () => {});
+            });
+        });
+
+        // 14. Home Slider Table
+        db.run(`CREATE TABLE IF NOT EXISTS home_slider (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT NOT NULL,
+            alt TEXT,
+            file_name TEXT,
+            file_size TEXT,
+            uploader_name TEXT,
+            display_order INTEGER DEFAULT 0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`, () => {
+             db.get("SELECT COUNT(*) AS count FROM home_slider", (err, row) => {
+                 if (row && row.count === 0) {
+                     const defaultSliders = [
+                         ['images/image-slider-1.jpg', 'Slider 1', 'image-slider-1.jpg', '850 KB', 'System Default', 0],
+                         ['images/image-slider-2.jpg', 'Slider 2', 'image-slider-2.jpg', '1.2 MB', 'System Default', 1],
+                         ['images/image-slider-3.jpg', 'Slider 3', 'image-slider-3.jpg', '980 KB', 'System Default', 2],
+                         ['images/image-slider-4.jpg', 'Slider 4', 'image-slider-4.jpg', '1.1 MB', 'System Default', 3],
+                         ['images/image-slider-5.jpg', 'Slider 5', 'image-slider-5.jpg', '920 KB', 'System Default', 4]
+                     ];
+                     const stmt = db.prepare("INSERT INTO home_slider (url, alt, file_name, file_size, uploader_name, display_order) VALUES (?, ?, ?, ?, ?, ?)");
+                     defaultSliders.forEach(s => stmt.run(s));
+                     stmt.finalize();
+                     console.log('Default home slider items seeded.');
+                 }
+             });
+        });
+
+        // 15. About Me Table (singleton — always id = 1)
+        db.run(`CREATE TABLE IF NOT EXISTS about_me (
+            id INTEGER PRIMARY KEY DEFAULT 1,
+            image_path TEXT,
+            paragraph1 TEXT,
+            paragraph2 TEXT,
+            paragraph3 TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            created_by TEXT,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_by TEXT
+        )`);
+
+        // --- Evolution for Bookings (Phase 2 & 3 Integration) ---
+        db.all("PRAGMA table_info(bookings)", [], (err, columns) => {
+            if (err || !columns) return;
+            const colNames = columns.map(c => c.name);
+            if (!colNames.includes('client_id')) db.run("ALTER TABLE bookings ADD COLUMN client_id INTEGER REFERENCES clients(id)", (e) => { if (e) console.error("Error adding client_id:", e.message); });
+            if (!colNames.includes('venue_id')) db.run("ALTER TABLE bookings ADD COLUMN venue_id INTEGER REFERENCES venues(id)", (e) => { if (e) console.error("Error adding venue_id:", e.message); });
+            if (!colNames.includes('google_event_id')) db.run("ALTER TABLE bookings ADD COLUMN google_event_id TEXT", (e) => { if (e) console.error("Error adding google_event_id:", e.message); });
+            if (!colNames.includes('quote_amount')) db.run("ALTER TABLE bookings ADD COLUMN quote_amount TEXT");
+            if (!colNames.includes('total_amount')) db.run("ALTER TABLE bookings ADD COLUMN total_amount DECIMAL(10,2)");
+            if (!colNames.includes('amount_outstanding')) db.run("ALTER TABLE bookings ADD COLUMN amount_outstanding DECIMAL(10,2)");
+            if (!colNames.includes('payment_status')) db.run("ALTER TABLE bookings ADD COLUMN payment_status TEXT DEFAULT 'UNPAID'");
+        });
+
+        // ==========================================
+        // PHASE 2: MODERN RELATIONAL SCHEMA
+        // ==========================================
+
+        // CORE ENTITIES
+        db.run(`CREATE TABLE IF NOT EXISTS clients (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            full_name TEXT NOT NULL,
+            company_name TEXT,
+            email TEXT NOT NULL UNIQUE,
+            phone TEXT NOT NULL,
+            billing_address TEXT,
+            tax_id TEXT,
+            vat_number TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`, (err) => { if (err) console.error("Error creating clients table:", err.message); });
+
+        db.run(`CREATE TABLE IF NOT EXISTS venues (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            address TEXT,
+            city TEXT,
+            state TEXT,
+            postal_code TEXT,
+            country TEXT,
+            place_id TEXT UNIQUE,
+            latitude REAL,
+            longitude REAL,
+            contact_name TEXT,
+            contact_phone TEXT,
+            contact_email TEXT,
+            capacity INTEGER,
+            load_in_time TEXT,
+            green_room_notes TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`, () => {
+            db.run("ALTER TABLE venues ADD COLUMN notes TEXT", () => {});
+            db.run("ALTER TABLE venues ADD COLUMN negotiated_rates TEXT", () => {});
+        });
+
+        // Advancing Pack — show-day operations (run-of-show, technical rider, hospitality,
+        // contacts, travel), editable from the Deal View's Advancing tab. 1:1 with a booking.
+        db.run(`CREATE TABLE IF NOT EXISTS advancing_packs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            booking_id INTEGER NOT NULL UNIQUE REFERENCES bookings(id),
+            status TEXT DEFAULT 'draft' CHECK(status IN ('draft','sent','confirmed')),
+            mic_type TEXT, pa_spec TEXT, monitors TEXT, lighting TEXT,
+            stage_layout TEXT, equipment_responsibility TEXT,
+            green_room_notes TEXT, meals TEXT, dietary TEXT, parking_wifi TEXT,
+            travel_type TEXT, flights TEXT, hotel TEXT, ground_transport TEXT,
+            internal_notes TEXT, pdf_url TEXT,
+            sent_to_client_at DATETIME, sent_to_venue_at DATETIME, confirmed_at DATETIME,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`, (err) => { if (err) console.error("Error creating advancing_packs table:", err.message); });
+
+        db.run(`CREATE TABLE IF NOT EXISTS run_of_show_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pack_id INTEGER NOT NULL REFERENCES advancing_packs(id) ON DELETE CASCADE,
+            sort_order INTEGER DEFAULT 0,
+            time_label TEXT,
+            duration_minutes INTEGER,
+            title TEXT NOT NULL,
+            detail TEXT,
+            responsible TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`, (err) => { if (err) console.error("Error creating run_of_show_items table:", err.message); });
+        db.run(`CREATE INDEX IF NOT EXISTS idx_ros_pack ON run_of_show_items(pack_id)`);
+
+        db.run(`CREATE TABLE IF NOT EXISTS advancing_contacts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pack_id INTEGER NOT NULL REFERENCES advancing_packs(id) ON DELETE CASCADE,
+            role TEXT, name TEXT, phone TEXT, email TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`, (err) => { if (err) console.error("Error creating advancing_contacts table:", err.message); });
+        db.run(`CREATE INDEX IF NOT EXISTS idx_advcontacts_pack ON advancing_contacts(pack_id)`);
+
+        db.run(`CREATE TABLE IF NOT EXISTS comedians (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            stage_name TEXT NOT NULL,
+            legal_name TEXT,
+            email TEXT,
+            phone TEXT,
+            default_currency TEXT DEFAULT 'ZAR',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`);
+        db.run(`INSERT OR IGNORE INTO comedians (id, stage_name, legal_name, email) VALUES (1, 'CulChar', 'CulChar Owner', 'hello@culchar.example')`);
+
+        // SERVICES & TAX
+        db.run(`CREATE TABLE IF NOT EXISTS services (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            description TEXT,
+            default_price DECIMAL(10,2) NOT NULL,
+            pricing_model TEXT DEFAULT 'flat_fee',
+            base_price DECIMAL(10,2),
+            min_quantity INTEGER DEFAULT 1,
+            max_quantity INTEGER,
+            display_unit TEXT DEFAULT 'unit',
+            is_taxable BOOLEAN DEFAULT 1,
+            category TEXT CHECK(category IN ('Performance','Travel','Production','Other')),
+            service_type TEXT DEFAULT 'core',
+            base_uom TEXT DEFAULT 'ea',
+            pricing_group TEXT DEFAULT 'Standard',
+            is_capital_asset BOOLEAN DEFAULT 0,
+            tax_class TEXT DEFAULT 'standard',
+            sac_code TEXT,
+            availability_rule TEXT DEFAULT 'any_time',
+            booking_lead_time_days INTEGER DEFAULT 0,
+            setup_time_minutes INTEGER DEFAULT 0,
+            performance_length_minutes INTEGER DEFAULT 0,
+            travel_included BOOLEAN DEFAULT 0,
+            preferred_resource_id INTEGER,
+            cost_center TEXT,
+            profit_center TEXT,
+            internal_note TEXT,
+            external_note TEXT,
+            valid_from TEXT,
+            valid_to TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`);
+
+        // Migrations for existing services table (direct in serialize flow)
+        const addCol = (col, def) => {
+            db.run(`ALTER TABLE services ADD COLUMN ${col} ${def}`, (err) => {
+                if (err && !err.message.includes('duplicate column name')) {
+                    // Ignore duplicate column errors
+                }
+            });
+        };
+
+        addCol('pricing_model', "TEXT DEFAULT 'flat_fee'");
+        // Normalise legacy 'flat' values written before the dropdown used 'flat_fee'
+        db.run("UPDATE services SET pricing_model = 'flat_fee' WHERE pricing_model = 'flat'");
+        addCol('base_price', "DECIMAL(10,2)");
+        addCol('min_quantity', "INTEGER DEFAULT 1");
+        addCol('max_quantity', "INTEGER");
+        addCol('display_unit', "TEXT DEFAULT 'unit'");
+        addCol('service_type', "TEXT DEFAULT 'core'");
+        addCol('base_uom', "TEXT DEFAULT 'ea'");
+        addCol('pricing_group', "TEXT DEFAULT 'Standard'");
+        addCol('is_capital_asset', "BOOLEAN DEFAULT 0");
+        addCol('tax_class', "TEXT DEFAULT 'standard'");
+        addCol('sac_code', "TEXT");
+        addCol('availability_rule', "TEXT DEFAULT 'any_time'");
+        addCol('booking_lead_time_days', "INTEGER DEFAULT 0");
+        addCol('setup_time_minutes', "INTEGER DEFAULT 0");
+        addCol('performance_length_minutes', "INTEGER DEFAULT 0");
+        addCol('travel_included', "BOOLEAN DEFAULT 0");
+        addCol('preferred_resource_id', "INTEGER");
+        addCol('cost_center', "TEXT");
+        addCol('profit_center', "TEXT");
+        addCol('internal_note', "TEXT");
+        addCol('external_note', "TEXT");
+        addCol('valid_from', "TEXT");
+        addCol('valid_to', "TEXT");
+        // SAP-extended batch 2
+        addCol('crew_required',      "INTEGER DEFAULT 1");
+        addCol('financial_category', "TEXT DEFAULT NULL");
+        addCol('legacy_code',        "TEXT DEFAULT NULL");
+        addCol('is_deleted',         "INTEGER DEFAULT 0");
+        addCol('revenue_gl_code',    "TEXT DEFAULT NULL");
+        addCol('marketing_segment',  "TEXT DEFAULT NULL");
+        addCol('item_category',      "TEXT DEFAULT 'DIEN'");
+        addCol('tax_category',       "TEXT DEFAULT NULL");
+        addCol('fulfillment_type',   "TEXT DEFAULT 'on_site'");
+        // Rate card 2026: price type / range / unit / featured / display group (lib/rate-card-2026.js)
+        require('./lib/rate-card-2026').NEW_COLUMNS.forEach(([c, d]) => addCol(c, d));
+
+
+
+        db.run(`CREATE TABLE IF NOT EXISTS booking_services (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            booking_id INTEGER NOT NULL,
+            service_id INTEGER NOT NULL,
+            quantity_minutes INTEGER DEFAULT 1,
+            unit_price REAL,
+            total_price REAL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (booking_id) REFERENCES bookings(id) ON DELETE CASCADE,
+            FOREIGN KEY (service_id) REFERENCES services(id)
+        )`);
+
+        db.run(`CREATE TABLE IF NOT EXISTS tax_rates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            rate DECIMAL(5,4) NOT NULL,
+            effective_from DATE NOT NULL,
+            effective_to DATE,
+            is_default BOOLEAN DEFAULT 0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`);
+        db.run(`INSERT OR IGNORE INTO tax_rates (name, rate, effective_from, is_default) VALUES ('South Africa Standard VAT', 0.1500, '2019-01-01', 1)`);
+
+        // BOOKING LINE ITEMS & QUOTATIONS
+        db.run(`CREATE TABLE IF NOT EXISTS booking_line_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            booking_id INTEGER NOT NULL,
+            service_id INTEGER,
+            description TEXT NOT NULL,
+            quantity INTEGER DEFAULT 1,
+            unit_price DECIMAL(10,2) NOT NULL,
+            tax_rate_id INTEGER,
+            is_taxable BOOLEAN DEFAULT 1,
+            total_price DECIMAL(10,2) GENERATED ALWAYS AS (quantity * unit_price) STORED,
+            FOREIGN KEY (booking_id) REFERENCES bookings(id) ON DELETE CASCADE,
+            FOREIGN KEY (service_id) REFERENCES services(id),
+            FOREIGN KEY (tax_rate_id) REFERENCES tax_rates(id)
+        )`);
+
+        db.run(`CREATE TABLE IF NOT EXISTS quotations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            booking_id INTEGER,
+            quote_number TEXT UNIQUE,
+            client_id INTEGER NOT NULL,
+            comedian_id INTEGER DEFAULT 1,
+            quote_date DATE DEFAULT CURRENT_DATE,
+            expiry_date DATE,
+            event_date DATE,
+            venue_name TEXT,
+            subtotal DECIMAL(10,2),
+            tax_amount DECIMAL(10,2),
+            total_amount DECIMAL(10,2),
+            status TEXT DEFAULT 'draft',
+            notes TEXT,
+            file_path TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (booking_id) REFERENCES bookings(id),
+            FOREIGN KEY (client_id) REFERENCES clients(id),
+            FOREIGN KEY (comedian_id) REFERENCES comedians(id)
+        )`, () => {
+            // Failsafe migration for quotations table
+            db.all("PRAGMA table_info(quotations)", (err, columns) => {
+                if (err || !columns) return;
+                const colNames = columns.map(c => c.name);
+                if (!colNames.includes('booking_id')) {
+                    db.run("ALTER TABLE quotations ADD COLUMN booking_id INTEGER REFERENCES bookings(id)", (e) => {
+                        if (e) console.error("Error adding booking_id to quotations:", e.message);
+                    });
+                }
+                if (!colNames.includes('file_path')) {
+                    db.run("ALTER TABLE quotations ADD COLUMN file_path TEXT", (e) => {
+                        if (e) console.error("Error adding file_path to quotations:", e.message);
+                    });
+                }
+                if (!colNames.includes('version'))
+                    db.run("ALTER TABLE quotations ADD COLUMN version INTEGER DEFAULT 1");
+                if (!colNames.includes('archived'))
+                    db.run("ALTER TABLE quotations ADD COLUMN archived INTEGER DEFAULT 0");
+                if (!colNames.includes('sent_at'))
+                    db.run("ALTER TABLE quotations ADD COLUMN sent_at DATETIME");
+            });
+        });
+
+        db.run(`CREATE TABLE IF NOT EXISTS quote_line_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            quotation_id INTEGER NOT NULL,
+            service_id INTEGER,
+            description TEXT NOT NULL,
+            quantity INTEGER DEFAULT 1,
+            unit_price DECIMAL(10,2) NOT NULL,
+            total_price DECIMAL(10,2) GENERATED ALWAYS AS (quantity * unit_price) STORED,
+            FOREIGN KEY (quotation_id) REFERENCES quotations(id) ON DELETE CASCADE,
+            FOREIGN KEY (service_id) REFERENCES services(id)
+        )`);
+
+        // INVOICES & TRANSACTIONS
+        db.run(`CREATE TABLE IF NOT EXISTS invoices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            booking_id INTEGER NOT NULL,
+            client_id INTEGER NOT NULL,
+            invoice_number TEXT UNIQUE NOT NULL,
+            invoice_date DATE NOT NULL DEFAULT CURRENT_DATE,
+            due_date DATE NOT NULL,
+            subtotal DECIMAL(10,2) NOT NULL,
+            tax_amount DECIMAL(10,2) DEFAULT 0,
+            total_amount DECIMAL(10,2) NOT NULL,
+            is_vat_inclusive BOOLEAN DEFAULT 1,
+            -- Invoice status runs an UPPERCASE lifecycle (DRAFT→SENT→OVERDUE→PAID/VOID); enforced by
+            -- trg_invoices_status_* below. Fresh installs default to 'DRAFT'; on the existing DB this
+            -- default is dormant (every INSERT specifies status explicitly).
+            status TEXT DEFAULT 'DRAFT',
+            void_reason TEXT,
+            voided_at DATETIME,
+            replacement_invoice_id INTEGER,
+            file_path TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (booking_id) REFERENCES bookings(id),
+            FOREIGN KEY (client_id) REFERENCES clients(id),
+            FOREIGN KEY (replacement_invoice_id) REFERENCES invoices(id)
+        )`, () => {
+            // Failsafe migration: file_path added after initial schema was deployed
+            db.run("ALTER TABLE invoices ADD COLUMN file_path TEXT", () => {});
+            db.run("ALTER TABLE invoices ADD COLUMN notes TEXT", () => {});
+            db.run("ALTER TABLE invoices ADD COLUMN sent_at DATETIME", () => {});
+            db.run("ALTER TABLE invoices ADD COLUMN pre_due_reminded_at DATETIME", () => {});
+            db.run("ALTER TABLE invoices ADD COLUMN overdue_reminded_at DATETIME", () => {});
+        });
+
+        db.run(`CREATE TABLE IF NOT EXISTS invoice_line_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            invoice_id INTEGER NOT NULL,
+            description TEXT NOT NULL,
+            quantity INTEGER DEFAULT 1,
+            unit_price DECIMAL(10,2) NOT NULL,
+            tax_rate_id INTEGER,
+            is_taxable BOOLEAN DEFAULT 1,
+            total_price DECIMAL(10,2) GENERATED ALWAYS AS (quantity * unit_price) STORED,
+            FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE CASCADE,
+            FOREIGN KEY (tax_rate_id) REFERENCES tax_rates(id)
+        )`);
+
+        db.run(`CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            booking_id INTEGER NOT NULL,
+            invoice_id INTEGER,
+            amount DECIMAL(10,2) NOT NULL,
+            transaction_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+            payment_method TEXT,
+            reference TEXT, -- added for server.js compatibility
+            reference_number TEXT,
+            transaction_type TEXT,
+            status TEXT DEFAULT 'pending',
+            notes TEXT,
+            pf_payment_id TEXT UNIQUE,
+            pf_signature TEXT,
+            pf_status TEXT,
+            ip_address TEXT,
+            is_verified INTEGER DEFAULT 0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (booking_id) REFERENCES bookings(id),
+            FOREIGN KEY (invoice_id) REFERENCES invoices(id)
+        )`, () => {
+            // Failsafe migration: reference column added after initial schema deployment
+            db.run("ALTER TABLE transactions ADD COLUMN reference TEXT", () => {});
+        });
+
+        // Recorded when a PayFast redirect is built (routes/public/bookings.js buildAndSendPfData),
+        // before the customer ever reaches PayFast — lets the ITN handler verify amount_gross
+        // against what THIS specific payment attempt was actually for (PayFast's own docs call this
+        // check pfValidPaymentData), not just that it doesn't overpay the booking as a whole.
+        // m_payment_id is UNIQUE and written with INSERT OR REPLACE: it's deterministic per
+        // booking+payment_type/schedule (e.g. "42_DEPOSIT"), so a customer retrying an abandoned
+        // payment reuses the same id on purpose — the replacement keeps the expected amount current
+        // if anything changed (a re-quote) between attempts, rather than checking against a stale one.
+        db.run(`CREATE TABLE IF NOT EXISTS payfast_payment_intents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            m_payment_id TEXT NOT NULL UNIQUE,
+            booking_id INTEGER NOT NULL,
+            expected_amount DECIMAL(10,2) NOT NULL,
+            payment_type TEXT,
+            schedule_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            fulfilled_at DATETIME,
+            FOREIGN KEY (booking_id) REFERENCES bookings(id)
+        )`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_payfast_intents_booking ON payfast_payment_intents(booking_id)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_payfast_intents_status ON payfast_payment_intents(status, created_at)`);
+
+        // CANCELLATIONS & REFUNDS
+        db.run(`CREATE TABLE IF NOT EXISTS cancellations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            booking_id INTEGER NOT NULL UNIQUE,
+            cancelled_by TEXT CHECK(cancelled_by IN ('client','comedian','mutual','force_majeure')),
+            reason TEXT,
+            total_paid_to_date DECIMAL(10,2),
+            refund_due DECIMAL(10,2),
+            retention_amount DECIMAL(10,2),
+            cancelled_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            refund_processed_at DATETIME,
+            notes TEXT,
+            FOREIGN KEY (booking_id) REFERENCES bookings(id)
+        )`);
+
+        // CONTRACTS
+        db.run(`CREATE TABLE IF NOT EXISTS contracts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            booking_id INTEGER NOT NULL UNIQUE,
+            template_version TEXT NOT NULL,
+            content_html TEXT,
+            content_hash TEXT,
+            pdf_url TEXT,
+            sent_to_client_at DATETIME,
+            signed_by_client_at DATETIME,
+            client_ip_address TEXT,
+            client_signature_data TEXT,
+            signed_by_comedian_at DATETIME,
+            status TEXT DEFAULT 'draft',
+            is_frozen BOOLEAN DEFAULT 0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (booking_id) REFERENCES bookings(id)
+        )`);
+
+        // COMMUNICATION LOG
+        db.run(`CREATE TABLE IF NOT EXISTS communication_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            booking_id INTEGER,
+            client_id INTEGER,
+            direction TEXT CHECK(direction IN ('incoming','outgoing')),
+            channel TEXT,
+            subject TEXT,
+            content_snippet TEXT,
+            sent_at DATETIME,
+            received_at DATETIME,
+            user_email TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (booking_id) REFERENCES bookings(id),
+            FOREIGN KEY (client_id) REFERENCES clients(id)
+        )`);
+
+        // SCHEDULING: DATE HOLDS & PAYMENT SCHEDULES
+        db.run(`CREATE TABLE IF NOT EXISTS date_holds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            comedian_id INTEGER DEFAULT 1,
+            client_id INTEGER,
+            hold_date DATE NOT NULL,
+            hold_expires_at DATETIME NOT NULL,
+            status TEXT DEFAULT 'active',
+            converted_to_booking_id INTEGER,
+            notes TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (comedian_id) REFERENCES comedians(id),
+            FOREIGN KEY (client_id) REFERENCES clients(id),
+            FOREIGN KEY (converted_to_booking_id) REFERENCES bookings(id)
+        )`);
+        // "Last Updated By" feature: date_holds (Calendar Block-Out) had no actor tracking at all.
+        // updated_by_role is a role-at-time-of-edit snapshot, set alongside updated_by in the same
+        // UPDATE statement, read by the extended audit_date_holds_update trigger into audit_log.actor_role.
+        db.run("ALTER TABLE date_holds ADD COLUMN created_by INTEGER REFERENCES admins(id)", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: date_holds.created_by already exists or error: " + err.message); });
+        db.run("ALTER TABLE date_holds ADD COLUMN updated_by INTEGER REFERENCES admins(id)", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: date_holds.updated_by already exists or error: " + err.message); });
+        db.run("ALTER TABLE date_holds ADD COLUMN updated_at DATETIME", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: date_holds.updated_at already exists or error: " + err.message); });
+        db.run("ALTER TABLE date_holds ADD COLUMN updated_by_role TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: date_holds.updated_by_role already exists or error: " + err.message); });
+
+        db.run(`CREATE TABLE IF NOT EXISTS payment_schedules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            booking_id INTEGER NOT NULL,
+            invoice_id INTEGER,
+            description TEXT NOT NULL,
+            due_date DATE NOT NULL,
+            expected_amount DECIMAL(10,2) NOT NULL,
+            status TEXT DEFAULT 'pending',
+            sequence INTEGER,
+            source TEXT DEFAULT 'auto',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (booking_id) REFERENCES bookings(id),
+            FOREIGN KEY (invoice_id) REFERENCES invoices(id)
+        )`);
+        // Migration 101 (client-selectable installment plans): sequence = 1-based position within
+        // its live batch ("Installment 2 of 3"), independent of due_date ordering; source =
+        // 'auto' (system default / admin-triggered ACCEPTED transition) | 'client' (client picked
+        // 2 or 3 at accept-quote) | 'admin' (built via the Setup Milestones editor). Added
+        // synchronously here, immediately after the CREATE TABLE and BEFORE any later
+        // synchronously-queued statement that might reference these columns — a column added only
+        // inside a nested async callback isn't guaranteed to exist yet when a same-tick statement
+        // elsewhere in this file needs it (the exact race that broke a fresh boot twice already
+        // this cycle, via events.google_calendar_event_id and bookings.is_public).
+        db.run("ALTER TABLE payment_schedules ADD COLUMN sequence INTEGER", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: payment_schedules.sequence already exists or error: " + err.message); });
+        db.run("ALTER TABLE payment_schedules ADD COLUMN source TEXT DEFAULT 'auto'", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: payment_schedules.source already exists or error: " + err.message); });
+        // Backfill sequence for existing LIVE rows only (same "live" scope as getLivePaymentScheduleCount:
+        // excludes superseded/cancelled), ordered by due_date then id. source needs no backfill —
+        // the ALTER's own DEFAULT 'auto' already wrote it into every pre-existing row.
+        db.run(`UPDATE payment_schedules
+                SET sequence = (
+                    SELECT COUNT(*) FROM payment_schedules p2
+                    WHERE p2.booking_id = payment_schedules.booking_id
+                      AND LOWER(COALESCE(p2.status,'pending')) NOT IN ('superseded','cancelled')
+                      AND (p2.due_date < payment_schedules.due_date
+                           OR (p2.due_date = payment_schedules.due_date AND p2.id <= payment_schedules.id))
+                )
+                WHERE sequence IS NULL
+                  AND LOWER(COALESCE(status,'pending')) NOT IN ('superseded','cancelled')`,
+            (err) => { if (err) console.error('[migration] payment_schedules.sequence backfill failed:', err.message); });
+
+        // S5-4: Threaded booking notes (replaces the single admin_notes text blob)
+        db.run(`CREATE TABLE IF NOT EXISTS booking_notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            booking_id INTEGER NOT NULL,
+            note TEXT NOT NULL,
+            author TEXT NOT NULL DEFAULT 'Admin',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (booking_id) REFERENCES bookings(id)
+        )`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_booking_notes_booking ON booking_notes(booking_id)`);
+
+        // Internal admin-only notes on an inquiry — structural mirror of booking_notes, with a
+        // created_by FK (author is still stored as free text for display, but derived from the
+        // session server-side rather than trusted from the client, unlike booking_notes' author).
+        db.run(`CREATE TABLE IF NOT EXISTS inquiry_notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            inquiry_id INTEGER NOT NULL REFERENCES inquiries(inquiry_id) ON DELETE CASCADE,
+            note TEXT NOT NULL,
+            author TEXT NOT NULL DEFAULT 'Admin',
+            created_by INTEGER REFERENCES admins(id),
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_inquiry_notes_inquiry ON inquiry_notes(inquiry_id)`);
+
+        // The conversation on an inquiry, one row per e-mail: the admin's replies (direction 'out', each tied to its outbox row so the delivery state
+        // is the truth about THAT message) and the customer's answers read from the booking mailbox (direction 'in'). The original web-form message
+        // is the inquiries row itself. delivery_status: queued -> attempted (a try failed, it will retry) -> accepted (Microsoft 365 took it) | failed
+        // (gave up) | bounced (a delivery-failure notice came back); inbound rows are 'received'. 'accepted' is as far as anyone can honestly know -
+        // an e-mail system cannot prove it reached an inbox. message_id (RFC 5322) and graph_id are unique, so nothing is ever stored twice.
+        db.run(`CREATE TABLE IF NOT EXISTS inquiry_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            inquiry_id INTEGER NOT NULL REFERENCES inquiries(inquiry_id) ON DELETE CASCADE,
+            direction TEXT NOT NULL CHECK(direction IN ('out','in')),
+            source TEXT NOT NULL DEFAULT 'admin_reply' CHECK(source IN ('admin_reply','mailbox')),
+            message_id TEXT,
+            graph_id TEXT,
+            in_reply_to TEXT,
+            from_address TEXT,
+            to_addresses TEXT,
+            cc_addresses TEXT,
+            subject TEXT,
+            body_html TEXT,
+            body_text TEXT,
+            direct_email_id INTEGER REFERENCES direct_emails(id) ON DELETE SET NULL,
+            notification_id INTEGER REFERENCES notifications(id) ON DELETE SET NULL,
+            delivery_status TEXT NOT NULL DEFAULT 'queued' CHECK(delivery_status IN ('queued','attempted','accepted','failed','bounced','received')),
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            sent_by INTEGER REFERENCES admins(id) ON DELETE SET NULL,
+            sent_by_name TEXT,
+            occurred_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            accepted_at DATETIME,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            CHECK((direction = 'out' AND delivery_status <> 'received') OR (direction = 'in' AND delivery_status = 'received'))
+        )`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_inquiry_messages_inquiry ON inquiry_messages(inquiry_id, occurred_at)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_inquiry_messages_notification ON inquiry_messages(notification_id)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_inquiry_messages_pending ON inquiry_messages(delivery_status) WHERE delivery_status IN ('queued','attempted')`);
+        db.run(`CREATE UNIQUE INDEX IF NOT EXISTS uq_inquiry_messages_message_id ON inquiry_messages(message_id) WHERE message_id IS NOT NULL`);
+        db.run(`CREATE UNIQUE INDEX IF NOT EXISTS uq_inquiry_messages_graph_id ON inquiry_messages(graph_id) WHERE graph_id IS NOT NULL`);
+
+        // Reading customer replies from the booking mailbox (lib/inbox-sync.js). One row, administrator-controlled, OFF until an administrator switches it on.
+        // delta_link is Microsoft Graph's own checkpoint ("everything after here"); it belongs to `mailbox`, and a different mailbox discards it. It lives here
+        // rather than in `settings` because that table's generic API is readable and writable by every admin role.
+        db.run(`CREATE TABLE IF NOT EXISTS inbox_sync_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+            mailbox TEXT,
+            delta_link TEXT,
+            baseline_at TEXT,
+            last_run_at TEXT,
+            last_success_at TEXT,
+            last_error TEXT,
+            last_error_category TEXT,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            retry_after TEXT,
+            last_stats TEXT,
+            enabled_by INTEGER REFERENCES admins(id) ON DELETE SET NULL,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`);
+        db.run(`INSERT OR IGNORE INTO inbox_sync_state (id) VALUES (1)`);
+
+        // ── Admin Calendar <-> Microsoft 365 (lib/calendar-m365.js, docs-internal/calendar-m365.md) ──
+        // One row of switches / checkpoint / health, like inbox_sync_state. OFF by default; the delta checkpoint (a URL) stays server-side.
+        db.run(`CREATE TABLE IF NOT EXISTS calendar_sync_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+            mailbox TEXT,
+            delta_link TEXT,
+            window_start TEXT,
+            window_end TEXT,
+            baseline_at TEXT,
+            last_run_at TEXT,
+            last_success_at TEXT,
+            last_error TEXT,
+            last_error_category TEXT,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            retry_after TEXT,
+            last_stats TEXT,
+            enabled_by INTEGER REFERENCES admins(id) ON DELETE SET NULL,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`);
+        db.run(`INSERT OR IGNORE INTO calendar_sync_state (id) VALUES (1)`);
+
+        // The ONLY mapping between a website record and its Microsoft event, and the recoverable queue: a row is written BEFORE anything is sent
+        // (create_token = the Graph transactionId), so a retry after a crash cannot create a second event. A website record is never deleted by the sync.
+        db.run(`CREATE TABLE IF NOT EXISTS calendar_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_type TEXT NOT NULL CHECK (source_type IN ('booking', 'event')),
+            source_id INTEGER NOT NULL,
+            graph_event_id TEXT,
+            create_token TEXT,
+            web_link TEXT,
+            sync_status TEXT NOT NULL DEFAULT 'pending' CHECK (sync_status IN ('pending', 'synced', 'error', 'conflict', 'external_deleted', 'removed')),
+            pushed_hash TEXT,
+            pushed_json TEXT,
+            change_key TEXT,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TEXT,
+            last_error TEXT,
+            last_error_category TEXT,
+            conflict_json TEXT,
+            last_pushed_at TEXT,
+            last_seen_at TEXT,
+            last_synced_at TEXT,
+            created_by INTEGER REFERENCES admins(id) ON DELETE SET NULL,
+            updated_by INTEGER REFERENCES admins(id) ON DELETE SET NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (source_type, source_id)
+        )`);
+        db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_calendar_links_graph ON calendar_links(graph_event_id) WHERE graph_event_id IS NOT NULL`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_calendar_links_status ON calendar_links(sync_status, next_attempt_at)`);
+
+        // Other people's appointments from the shared calendar, read-only. Text is stored entity-encoded once (stored-text convention); Busy / Out-of-office
+        // events also hold the date through date_holds rows (block_type 'm365_sync', m365_event_id) so the public booking form cannot double-book that time.
+        db.run(`CREATE TABLE IF NOT EXISTS calendar_external_events (
+            graph_event_id TEXT PRIMARY KEY,
+            subject TEXT,
+            start_date TEXT NOT NULL,
+            start_time TEXT,
+            end_date TEXT NOT NULL,
+            end_time TEXT,
+            all_day INTEGER NOT NULL DEFAULT 0,
+            show_as TEXT,
+            location TEXT,
+            is_online INTEGER NOT NULL DEFAULT 0,
+            join_url TEXT,
+            web_link TEXT,
+            series_master_id TEXT,
+            change_key TEXT,
+            blocks INTEGER NOT NULL DEFAULT 0,
+            graph_modified_at TEXT,
+            first_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            last_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_calendar_external_start ON calendar_external_events(start_date)`);
+        db.run("ALTER TABLE date_holds ADD COLUMN m365_event_id TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: date_holds.m365_event_id already exists or could not be added:", err.message); });
+        db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_date_holds_m365 ON date_holds(m365_event_id, hold_date) WHERE m365_event_id IS NOT NULL`);
+
+        // What the sync did and why (who, what, outcome) - the trail an administrator reads when something looks wrong. No token, no secret, no client contact data.
+        db.run(`CREATE TABLE IF NOT EXISTS calendar_sync_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            direction TEXT NOT NULL,
+            action TEXT NOT NULL,
+            source_type TEXT,
+            source_id INTEGER,
+            graph_event_id TEXT,
+            outcome TEXT NOT NULL CHECK (outcome IN ('ok', 'error', 'skipped')),
+            category TEXT,
+            message TEXT,
+            actor_id INTEGER REFERENCES admins(id) ON DELETE SET NULL
+        )`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_calendar_sync_log_source ON calendar_sync_log(source_type, source_id, id)`);
+
+        // EXPENSES (SARS Mileage & Per Diem)
+        db.run(`CREATE TABLE IF NOT EXISTS expenses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            booking_id INTEGER,
+            expense_date DATE NOT NULL,
+            category TEXT CHECK(category IN ('mileage','airfare','accommodation','meals','per_diem','parking_tolls','marketing','props','misc')),
+            description TEXT NOT NULL,
+            amount DECIMAL(10,2) NOT NULL,
+            start_odometer INTEGER,
+            end_odometer INTEGER,
+            total_km INTEGER GENERATED ALWAYS AS (end_odometer - start_odometer) STORED,
+            rate_per_km DECIMAL(6,2),
+            per_diem_days DECIMAL(3,1),
+            per_diem_rate DECIMAL(8,2),
+            receipt_url TEXT,
+            reimbursable BOOLEAN DEFAULT 0,
+            reimbursed_amount DECIMAL(10,2) DEFAULT 0,
+            vat_paid DECIMAL(10,2),
+            is_personal_component BOOLEAN DEFAULT 0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            deleted_at DATETIME DEFAULT NULL,
+            FOREIGN KEY (booking_id) REFERENCES bookings(id)
+        )`);
+
+        // Expenses migrations — add columns that may not exist in older DB files
+        db.run("ALTER TABLE expenses ADD COLUMN vat_rate DECIMAL(5,2) DEFAULT 15", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('expenses.vat_rate migration note:', err.message); });
+        db.run("ALTER TABLE expenses ADD COLUMN vendor TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('expenses.vendor note:', err.message); });
+        db.run("ALTER TABLE expenses ADD COLUMN deleted_at DATETIME DEFAULT NULL", (err) => { if (err && !err.message.includes('duplicate column name')) {} });
+
+        // FINANCIAL AUDIT LOG table
+        db.run(`CREATE TABLE IF NOT EXISTS financial_audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL,
+            entity_type TEXT NOT NULL,
+            entity_id INTEGER NOT NULL,
+            amount DECIMAL(10,2),
+            changed_by TEXT NOT NULL,
+            notes TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`);
+
+        // BANK STATEMENT LINES — for CSV import + manual matching
+        db.run(`CREATE TABLE IF NOT EXISTS bank_statement_lines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            import_batch TEXT NOT NULL,
+            import_date DATE NOT NULL,
+            statement_date DATE NOT NULL,
+            description TEXT,
+            amount DECIMAL(10,2) NOT NULL,
+            reference TEXT,
+            matched_transaction_id INTEGER,
+            matched_booking_id INTEGER,
+            match_note TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (matched_transaction_id) REFERENCES transactions(id),
+            FOREIGN KEY (matched_booking_id) REFERENCES bookings(id)
+        )`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_bsl_batch ON bank_statement_lines(import_batch)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_bsl_matched ON bank_statement_lines(matched_transaction_id)`);
+
+        // POLICIES & SETTINGS
+        db.run(`CREATE TABLE IF NOT EXISTS policies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            policy_key TEXT UNIQUE NOT NULL,
+            policy_value TEXT NOT NULL,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`);
+
+        db.run(`CREATE TABLE IF NOT EXISTS settings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            setting_key TEXT UNIQUE NOT NULL,
+            setting_value TEXT NOT NULL,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`, () => {
+            // Seed editable homepage content (Hero paragraph + "What I Do" section) so the admin
+            // editors are pre-populated and index.html renders from the DB. INSERT OR IGNORE keeps
+            // any admin edits intact across restarts; absent values fall back to the static HTML.
+            db.run(`INSERT OR IGNORE INTO settings (setting_key, setting_value) VALUES ('announcement_enabled', '1')`);
+            db.run(`INSERT OR IGNORE INTO settings (setting_key, setting_value) VALUES ('announcement_rotate', '1')`);
+            // Public homepage section visibility (JSON map); '{}' = every section visible by default.
+            db.run(`INSERT OR IGNORE INTO settings (setting_key, setting_value) VALUES ('section_visibility', '{}')`);
+            db.run(`INSERT OR IGNORE INTO settings (setting_key, setting_value) VALUES ('announcement_text', ?)`,
+                ['<strong>Funny Business </strong> World Wide ']);
+            db.run(`INSERT OR IGNORE INTO settings (setting_key, setting_value) VALUES ('hero_tagline', 'The code we live by.')`);
+            db.run(`INSERT OR IGNORE INTO settings (setting_key, setting_value) VALUES ('hero_subtitle', ?)`,
+                ["An award winning South African stand-up comedian, writer, actor, podcaster and TV presenter from Barberton, bringing a decade of stage-craft, razor-sharp wit and premium entertainment to South Africa's biggest rooms."]);
+            db.run(`INSERT OR IGNORE INTO settings (setting_key, setting_value) VALUES ('features_items', ?)`,
+                [JSON.stringify([
+                    { title: '10+ Years', description: 'On stage since 2014' },
+                    { title: '200+ Shows', description: 'Live performances' },
+                    { title: '15+ Credits', description: 'TV, film & voice-over' },
+                    { title: '3 Languages', description: 'English, IsiSwati & Hilarious' }
+                ])]);
+            db.run(`INSERT OR IGNORE INTO settings (setting_key, setting_value) VALUES ('services_eyebrow', 'What I do')`);
+            db.run(`INSERT OR IGNORE INTO settings (setting_key, setting_value) VALUES ('services_heading', 'From the mic to the <em>moment</em>')`);
+            db.run(`INSERT OR IGNORE INTO settings (setting_key, setting_value) VALUES ('services_items', ?)`,
+                [JSON.stringify(require('./lib/homepage-service-cards').NEW_DEFAULT_CARDS)]);
+        });
+
+
+
+        // AUDIT LOG
+        db.run(`CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            table_name TEXT NOT NULL,
+            record_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            user_email TEXT,
+            ip_address TEXT,
+            old_values TEXT,
+            new_values TEXT,
+            changed_by TEXT,
+            changes_json TEXT,
+            change_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            reason TEXT
+        )`);
+
+        // PAYMENT REMINDERS LOG
+        db.run(`CREATE TABLE IF NOT EXISTS reminders_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            booking_id INTEGER NOT NULL,
+            schedule_id INTEGER,
+            days_before INTEGER NOT NULL,
+            due_date DATE NOT NULL,
+            amount_due DECIMAL(10,2),
+            recipient_email TEXT NOT NULL,
+            sent_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            status TEXT DEFAULT 'sent',
+            error_message TEXT,
+            FOREIGN KEY (booking_id) REFERENCES bookings(id),
+            FOREIGN KEY (schedule_id) REFERENCES payment_schedules(id),
+            UNIQUE(booking_id, schedule_id, days_before)
+        )`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_reminders_booking ON reminders_log(booking_id)`);
+        // Reminders delivery tracking columns
+        db.run("ALTER TABLE reminders_log ADD COLUMN delivered_at DATETIME", (err) => { if (err && !err.message.includes('duplicate column name')) {} });
+        db.run("ALTER TABLE reminders_log ADD COLUMN opened_at DATETIME", (err) => { if (err && !err.message.includes('duplicate column name')) {} });
+        db.run("ALTER TABLE reminders_log ADD COLUMN bounce_reason TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) {} });
+
+        // UNIFIED NOTIFICATIONS TABLE
+        db.run(`CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT NOT NULL,
+            channel TEXT NOT NULL DEFAULT 'email',
+            status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'sending', 'sent', 'failed', 'read', 'dismissed')),
+            priority TEXT NOT NULL DEFAULT 'normal' CHECK(priority IN ('low', 'normal', 'high', 'urgent')),
+            recipient_email TEXT,
+            recipient_name TEXT,
+            subject TEXT,
+            body TEXT,
+            attachment_paths TEXT,
+            related_entity TEXT,
+            related_id INTEGER,
+            scheduled_at DATETIME,
+            sent_at DATETIME,
+            read_at DATETIME,
+            retry_count INTEGER DEFAULT 0,
+            error_message TEXT,
+            created_by INTEGER REFERENCES admins(id),
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`, () => {
+            db.run("ALTER TABLE notifications ADD COLUMN attachment_paths TEXT", () => {});
+        });
+        db.run(`CREATE INDEX IF NOT EXISTS idx_notifications_status ON notifications(status)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_notifications_entity ON notifications(related_entity, related_id)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_notifications_scheduled ON notifications(scheduled_at)`);
+        // Attachment bytes for queued emails (lib/queued-attachments.js): content-addressed, so one PDF sent to 500 subscribers is stored once,
+        // and deleted as soon as no pending email references it.
+        db.run(`CREATE TABLE IF NOT EXISTS notification_attachments (
+            sha256 TEXT PRIMARY KEY,
+            size INTEGER NOT NULL,
+            data BLOB NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`);
+
+        // DIRECT EMAILS (DRAFTS & SCHEDULED REPLIES/COMPOSITIONS)
+        db.run(`CREATE TABLE IF NOT EXISTS direct_emails (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            inquiry_id INTEGER REFERENCES inquiries(inquiry_id) ON DELETE SET NULL,
+            to_emails TEXT NOT NULL,
+            cc_emails TEXT,
+            bcc_emails TEXT,
+            reply_to TEXT,
+            subject TEXT,
+            body TEXT NOT NULL,
+            branding_option TEXT DEFAULT 'logo',
+            selected_banner_url TEXT,
+            attachment_paths TEXT,
+            scheduled_at DATETIME,
+            status TEXT DEFAULT 'draft' CHECK(status IN ('draft', 'scheduled', 'sent', 'failed', 'cancelled')),
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_direct_emails_status ON direct_emails(status)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_direct_emails_inquiry ON direct_emails(inquiry_id)`, () => repairEncodedRichText('direct_emails', 'body'));
+        // Who wrote the draft - a scheduled send fires with no session, and the inquiry's reply history must still name the admin.
+        db.run("ALTER TABLE direct_emails ADD COLUMN created_by INTEGER REFERENCES admins(id) ON DELETE SET NULL", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: direct_emails.created_by already exists or error: " + err.message); });
+
+        // EMAIL BANNER REGISTRY (Prompt 5) — per-category banner images assignable to lifecycle
+        // email templates. Independent of direct_emails.selected_banner_url (the separate Direct
+        // Emails composer) and of js/emailAssets.js's single global CID banner (legacy wrapper path).
+        db.run(`CREATE TABLE IF NOT EXISTS banners (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            category TEXT NOT NULL CHECK(category IN (
+                'Booking Requests','Quotes & Proposals','Contracts & Signatures','Payments & Invoices',
+                'Booking Confirmations','Event Reminders','Thank You & Reviews','Booking Recovery',
+                'Contact & Support','Newsletters & Marketing','User Accounts & Security'
+            )),
+            image_url TEXT NOT NULL,
+            alt_text TEXT NOT NULL,
+            headline TEXT,
+            subtitle TEXT,
+            status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','archived')),
+            created_by INTEGER REFERENCES admins(id),
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_banners_category ON banners(category)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_banners_status ON banners(status)`);
+
+        // One row per rebuilt lifecycle email's stable template_key (seeded by
+        // scripts/seed-banner-templates.js, not user-created — assignment only).
+        db.run(`CREATE TABLE IF NOT EXISTS email_template_banners (
+            template_key TEXT PRIMARY KEY,
+            category TEXT NOT NULL,
+            banner_id INTEGER REFERENCES banners(id) ON DELETE SET NULL,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_email_template_banners_banner_id ON email_template_banners(banner_id)`);
+
+        // Migration: add 'Birthday' to banners.category's CHECK constraint. SQLite can't ALTER a
+        // CHECK constraint, so this is the one genuine table-rebuild in this codebase (everywhere
+        // else is purely-additive ALTER TABLE ADD COLUMN). Guarded by inspecting the table's own
+        // stored SQL — self-verifying, not a separate tracking flag that could drift from reality.
+        // Written as explicit nested callbacks (not relying on serialize() queue ordering) since
+        // each step must only run after the previous one actually succeeded.
+        db.get("SELECT sql FROM sqlite_master WHERE type='table' AND name='banners'", (sqlErr, row) => {
+            if (sqlErr || !row || row.sql.includes("'Birthday'")) return;
+            console.log('[migration] Adding Birthday category to banners.category CHECK constraint...');
+            db.run("PRAGMA foreign_keys=OFF", () => {
+                db.run("BEGIN TRANSACTION", (beginErr) => {
+                    if (beginErr) { console.error('[migration] BEGIN failed:', beginErr.message); return; }
+                    db.run(`CREATE TABLE banners_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        category TEXT NOT NULL CHECK(category IN (
+                            'Booking Requests','Quotes & Proposals','Contracts & Signatures','Payments & Invoices',
+                            'Booking Confirmations','Event Reminders','Thank You & Reviews','Booking Recovery',
+                            'Contact & Support','Newsletters & Marketing','User Accounts & Security','Birthday'
+                        )),
+                        image_url TEXT NOT NULL,
+                        alt_text TEXT NOT NULL,
+                        headline TEXT,
+                        subtitle TEXT,
+                        status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','archived')),
+                        created_by INTEGER REFERENCES admins(id),
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )`, (createErr) => {
+                        if (createErr) { console.error('[migration] create banners_new failed:', createErr.message); return db.run("ROLLBACK", () => db.run("PRAGMA foreign_keys=ON")); }
+                        db.run("INSERT INTO banners_new SELECT * FROM banners", (copyErr) => {
+                            if (copyErr) { console.error('[migration] copy banners failed:', copyErr.message); return db.run("ROLLBACK", () => db.run("PRAGMA foreign_keys=ON")); }
+                            db.run("DROP TABLE banners", (dropErr) => {
+                                if (dropErr) { console.error('[migration] drop banners failed:', dropErr.message); return db.run("ROLLBACK", () => db.run("PRAGMA foreign_keys=ON")); }
+                                db.run("ALTER TABLE banners_new RENAME TO banners", (renameErr) => {
+                                    if (renameErr) { console.error('[migration] rename banners_new failed:', renameErr.message); return db.run("ROLLBACK", () => db.run("PRAGMA foreign_keys=ON")); }
+                                    db.run(`CREATE INDEX IF NOT EXISTS idx_banners_category ON banners(category)`);
+                                    db.run(`CREATE INDEX IF NOT EXISTS idx_banners_status ON banners(status)`);
+                                    db.run("COMMIT", (commitErr) => {
+                                        db.run("PRAGMA foreign_keys=ON");
+                                        if (commitErr) { console.error('[migration] commit failed:', commitErr.message); return; }
+                                        console.log('[migration] Birthday category added successfully.');
+                                    });
+                                });
+                            });
+                        });
+                    });
+                });
+            });
+        });
+        // Registers the Birthday newsletter template key (idempotent — mirrors the seeding scripts/
+        // seed-banner-templates.js does for the other lifecycle template keys).
+        db.run(`INSERT OR IGNORE INTO email_template_banners (template_key, category) VALUES ('subscriber_birthday', 'Birthday')`);
+        // Registers the booking-tracker OTP email (2026-07-16) so it's a manageable citizen of the
+        // banner registry like every other PREMIUM-track template — same idempotent pattern as above.
+        // Grouped with password_reset/dashboard_invite: same "short security/utility email" shape.
+        db.run(`INSERT OR IGNORE INTO email_template_banners (template_key, category) VALUES ('booking_verification_code', 'User Accounts & Security')`);
+
+        // SCHEMA MIGRATIONS TRACKING TABLE
+        db.run(`CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`);
+
+        // ==========================================
+        // SCHEMA EVOLUTION: ALTER EXISTING TABLES
+        // ==========================================
+        db.run("ALTER TABLE bookings ADD COLUMN client_id INTEGER REFERENCES clients(id)", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: client_id already exists or error: " + err.message); });
+        db.run("ALTER TABLE bookings ADD COLUMN venue_id INTEGER REFERENCES venues(id)", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: venue_id already exists or error: " + err.message); });
+        db.run("ALTER TABLE bookings ADD COLUMN quotation_id INTEGER REFERENCES quotations(id)", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: quotation_id already exists or error: " + err.message); });
+        db.run("ALTER TABLE bookings ADD COLUMN google_event_id TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: google_event_id already exists or error: " + err.message); });
+        db.run("ALTER TABLE bookings ADD COLUMN cancellation_policy TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: cancellation_policy already exists or error: " + err.message); });
+        db.run("ALTER TABLE bookings ADD COLUMN cancellation_deadline DATE", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: cancellation_deadline already exists or error: " + err.message); });
+        db.run("ALTER TABLE bookings ADD COLUMN cancelled_by TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: cancelled_by already exists or error: " + err.message); });
+        db.run("ALTER TABLE bookings ADD COLUMN cancellation_reason TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: cancellation_reason already exists or error: " + err.message); });
+        db.run("ALTER TABLE bookings ADD COLUMN refund_amount DECIMAL(10,2)", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: refund_amount already exists or error: " + err.message); });
+        db.run("ALTER TABLE bookings ADD COLUMN vat_number TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: vat_number already exists or error: " + err.message); });
+        
+        // Cancellation workflow columns
+        db.run("ALTER TABLE cancellations ADD COLUMN admin_id INTEGER", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: admin_id already exists or error: " + err.message); });
+        db.run("ALTER TABLE cancellations ADD COLUMN refund_status TEXT DEFAULT 'pending'", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: refund_status already exists or error: " + err.message); });
+
+        // Unification of events and bookings
+        db.run("ALTER TABLE events ADD COLUMN booking_id INTEGER REFERENCES bookings(id)", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: booking_id already exists or error: " + err.message); });
+        db.run("ALTER TABLE events ADD COLUMN venue_id INTEGER REFERENCES venues(id) ON DELETE SET NULL", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: venue_id already exists or error: " + err.message); });
+        db.run("ALTER TABLE events ADD COLUMN event_start_time TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: event_start_time already exists or error: " + err.message); });
+        db.run("ALTER TABLE events ADD COLUMN event_end_time TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: event_end_time already exists or error: " + err.message); });
+        db.run("ALTER TABLE bookings ADD COLUMN event_id INTEGER REFERENCES events(event_id)", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: event_id already exists or error: " + err.message); });
+        db.run("ALTER TABLE bookings ADD COLUMN show_on_website BOOLEAN DEFAULT 0", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: show_on_website already exists or error: " + err.message); });
+        db.run("ALTER TABLE events ADD COLUMN cancelled_at DATETIME", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: events.cancelled_at already exists or error: " + err.message); });
+        db.run("ALTER TABLE events ADD COLUMN cancellation_reason TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: events.cancellation_reason already exists or error: " + err.message); });
+        db.run("ALTER TABLE events ADD COLUMN event_type TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: events.event_type already exists or error: " + err.message); });
+        db.run("ALTER TABLE events ADD COLUMN event_capacity INTEGER", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: events.event_capacity already exists or error: " + err.message); });
+        // Featuring / Organiser for the public event pop-up (optional text, routes/admin/events.js saveEventCredits)
+        db.run("ALTER TABLE events ADD COLUMN event_featuring TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: events.event_featuring already exists or error: " + err.message); });
+        db.run("ALTER TABLE events ADD COLUMN event_organiser TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: events.event_organiser already exists or error: " + err.message); });
+        db.run("ALTER TABLE events ADD COLUMN client_id INTEGER REFERENCES clients(id)", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: events.client_id already exists or error: " + err.message); });
+        db.run("ALTER TABLE date_holds ADD COLUMN event_id INTEGER REFERENCES events(event_id)", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: event_id already exists or error: " + err.message); });
+        db.run("ALTER TABLE date_holds ADD COLUMN start_time TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: date_holds.start_time already exists or error: " + err.message); });
+        db.run("ALTER TABLE date_holds ADD COLUMN end_time TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: date_holds.end_time already exists or error: " + err.message); });
+        db.run("ALTER TABLE date_holds ADD COLUMN block_type TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: date_holds.block_type already exists or error: " + err.message); });
+        db.run("ALTER TABLE date_holds ADD COLUMN google_event_id TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: date_holds.google_event_id already exists or error: " + err.message); });
+
+        // Refund tracking columns on cancellations
+        db.run("ALTER TABLE cancellations ADD COLUMN refund_amount REAL DEFAULT 0", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: cancellations.refund_amount already exists."); });
+        db.run("ALTER TABLE cancellations ADD COLUMN refund_reference TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: cancellations.refund_reference already exists."); });
+        db.run("ALTER TABLE cancellations ADD COLUMN refund_notes TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: cancellations.refund_notes already exists."); });
+        db.run("ALTER TABLE cancellations ADD COLUMN refunded_at DATETIME", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: cancellations.refunded_at already exists."); });
+
+        // bookings.completed_at timestamp
+        db.run("ALTER TABLE bookings ADD COLUMN completed_at DATETIME", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: bookings.completed_at already exists."); });
+
+        // Newsletter subscribers: close schema drift — these two columns are read/written
+        // throughout server.js but were only ever added to the live DB by a one-off standalone
+        // migration script, never to this declarative schema. A fresh clone was missing them.
+        db.run("ALTER TABLE newsletter_subscribers ADD COLUMN active INTEGER DEFAULT 1", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note:', err.message); });
+        db.run("ALTER TABLE newsletter_subscribers ADD COLUMN unsubscribe_token TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note:', err.message); });
+        // Newsletter subscribers: personalization foundation (first name + day/month-only birthday,
+        // no year — used for recurring annual birthday automation and merge-field personalization)
+        db.run("ALTER TABLE newsletter_subscribers ADD COLUMN first_name TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note:', err.message); });
+        db.run("ALTER TABLE newsletter_subscribers ADD COLUMN birthday_day INTEGER", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note:', err.message); });
+        db.run("ALTER TABLE newsletter_subscribers ADD COLUMN birthday_month INTEGER", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note:', err.message); });
+        db.run("ALTER TABLE newsletter_subscribers ADD COLUMN tags TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note:', err.message); });
+        db.run("ALTER TABLE newsletter_subscribers ADD COLUMN internal_notes TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note:', err.message); });
+        db.run(`CREATE INDEX IF NOT EXISTS idx_newsletter_subscribers_birthday ON newsletter_subscribers(birthday_month, birthday_day)`);
+
+        // Double opt-in: audit timestamp for when a pending_confirmation subscriber actually
+        // confirmed. Nullable — NULL for admin-added/CSV-imported subscribers (never pending)
+        // and for anyone who hasn't confirmed yet. No CHECK constraint on `status` exists (by
+        // design, see Phase 1), so the new 'pending_confirmation' status value needs no migration.
+        db.run("ALTER TABLE newsletter_subscribers ADD COLUMN confirmed_at DATETIME", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note:', err.message); });
+
+        // Newsletter campaigns/scheduled sends: persist recipient/success/fail counts instead of
+        // discarding them after the HTTP response (newsletter_campaigns) or overloading `status`
+        // with a composite "sent (n/m)" string (scheduled_newsletters) — status stays a clean value.
+        db.run("ALTER TABLE newsletter_campaigns ADD COLUMN recipient_count INTEGER", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note:', err.message); });
+        db.run("ALTER TABLE newsletter_campaigns ADD COLUMN success_count INTEGER", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note:', err.message); });
+        db.run("ALTER TABLE newsletter_campaigns ADD COLUMN fail_count INTEGER", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note:', err.message); });
+        db.run("ALTER TABLE scheduled_newsletters ADD COLUMN success_count INTEGER", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note:', err.message); });
+        db.run("ALTER TABLE scheduled_newsletters ADD COLUMN fail_count INTEGER", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note:', err.message); });
+        // Audience segmentation choice, persisted so a scheduled send still targets the segment
+        // the admin picked at compose time, not just "all active" once the job actually fires.
+        db.run("ALTER TABLE scheduled_newsletters ADD COLUMN segment TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note:', err.message); });
+        db.run("ALTER TABLE scheduled_newsletters ADD COLUMN segment_value TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note:', err.message); });
+
+        // bookings: admin notes + background clerk tracking columns
+        db.run("ALTER TABLE bookings ADD COLUMN admin_notes TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note:', err.message); });
+        db.run("ALTER TABLE bookings ADD COLUMN quote_expiry_warned DATETIME", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note:', err.message); });
+        db.run("ALTER TABLE bookings ADD COLUMN pending_expiry_warned DATETIME", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note:', err.message); });
+        db.run("ALTER TABLE bookings ADD COLUMN overdue_reminded_at DATETIME", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note:', err.message); });
+        db.run("ALTER TABLE bookings ADD COLUMN quote_follow_up_sent_at DATETIME", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note:', err.message); });
+        // Audit-gap fixes: pending_at timestamp and venue place ID storage
+        db.run("ALTER TABLE bookings ADD COLUMN pending_at DATETIME", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note:', err.message); });
+        db.run("ALTER TABLE bookings ADD COLUMN venue_place_id TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note:', err.message); });
+        // S3-4: Digital acceptance record — IP and timestamp of client quote acceptance
+        db.run("ALTER TABLE bookings ADD COLUMN acceptance_ip TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note:', err.message); });
+        db.run("ALTER TABLE bookings ADD COLUMN acceptance_agreed_at DATETIME", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note:', err.message); });
+        // S4-1: Tracks when the DEPOSIT_PAID approaching-event reminder was last sent
+        db.run("ALTER TABLE bookings ADD COLUMN deposit_balance_reminded_at DATETIME", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note:', err.message); });
+        db.run("ALTER TABLE bookings ADD COLUMN rebooked_from_id INTEGER", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note:', err.message); });
+        db.run("ALTER TABLE bookings ADD COLUMN source_inquiry_id INTEGER REFERENCES inquiries(inquiry_id) ON DELETE SET NULL", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note:', err.message); });
+        db.run(`CREATE INDEX IF NOT EXISTS idx_bookings_source_inquiry_id ON bookings(source_inquiry_id)`);
+        // S6-1: Tracks when the post-event follow-up (review request) email was auto-sent
+        db.run("ALTER TABLE bookings ADD COLUMN review_email_sent_at DATETIME", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note:', err.message); });
+        // X3: Structured performance time columns (parsed from free-text performance_slot on write)
+        db.run("ALTER TABLE bookings ADD COLUMN performance_start_time TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note:', err.message); });
+        db.run("ALTER TABLE bookings ADD COLUMN performance_end_time TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note:', err.message); });
+        // Booking attachments: JSON array [{filename, original_name, mime_type, size}]
+        db.run("ALTER TABLE bookings ADD COLUMN attachment_files TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note:', err.message); });
+        // SC-1: Structured reason code for client-initiated cancellations
+        db.run("ALTER TABLE cancellations ADD COLUMN reason_code TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note:', err.message); });
+        // X2: Keep amount_outstanding in sync whenever amount_paid or total_amount changes
+        db.run(`CREATE TRIGGER IF NOT EXISTS trg_recalc_outstanding
+                AFTER UPDATE OF amount_paid, total_amount ON bookings
+                FOR EACH ROW WHEN NEW.amount_outstanding != MAX(0, COALESCE(NEW.total_amount,0) - COALESCE(NEW.amount_paid,0))
+                BEGIN
+                    UPDATE bookings SET amount_outstanding = MAX(0, COALESCE(NEW.total_amount,0) - COALESCE(NEW.amount_paid,0)) WHERE id = NEW.id;
+                END`, (err) => { if (err && !err.message.includes('already exists')) console.log('Note (trigger):', err.message); });
+
+        // Auto-set payment_status='PAID' when amount_outstanding reaches 0
+        db.run(`CREATE TRIGGER IF NOT EXISTS trg_auto_payment_status
+                AFTER UPDATE OF amount_outstanding ON bookings
+                FOR EACH ROW WHEN NEW.amount_outstanding = 0 AND COALESCE(NEW.total_amount, 0) > 0 AND NEW.payment_status != 'PAID'
+                BEGIN
+                    UPDATE bookings SET payment_status = 'PAID' WHERE id = NEW.id;
+                END`, (err) => { if (err && !err.message.includes('already exists')) console.log('Note (trigger):', err.message); });
+
+        // ── Status-value guards (migration 50) ─────────────────────────────────────────────
+        // invoices/contracts/payment_schedules/quotations were created without a CHECK(status IN …)
+        // constraint (unlike ~14 other tables in this schema). SQLite can't ALTER-add a CHECK to an
+        // existing table without a full rebuild — risky here (invoices has inbound FKs + a self-FK,
+        // and the DB lives in OneDrive). These BEFORE INSERT/UPDATE triggers deliver the same
+        // fail-loud enforcement: an out-of-set status RAISEs ABORT instead of silently persisting a
+        // value the app's UPPER()/exact-match reads would then never match. Live data is already
+        // clean and every literal the code writes is in-set, so no existing write breaks.
+        const statusGuard = (table, col, allowed) => {
+            const inList = allowed.map(v => `'${v}'`).join(',');
+            const mkErr = `${table}.${col} must be one of ${allowed.join('/')}`;
+            db.run(`CREATE TRIGGER IF NOT EXISTS trg_${table}_${col}_insert
+                    BEFORE INSERT ON ${table}
+                    FOR EACH ROW WHEN NEW.${col} IS NOT NULL AND NEW.${col} NOT IN (${inList})
+                    BEGIN SELECT RAISE(ABORT, '${mkErr}'); END`,
+                (err) => { if (err && !err.message.includes('already exists')) console.log('Note (trigger):', err.message); });
+            db.run(`CREATE TRIGGER IF NOT EXISTS trg_${table}_${col}_update
+                    BEFORE UPDATE OF ${col} ON ${table}
+                    FOR EACH ROW WHEN NEW.${col} IS NOT NULL AND NEW.${col} NOT IN (${inList})
+                    BEGIN SELECT RAISE(ABORT, '${mkErr}'); END`,
+                (err) => { if (err && !err.message.includes('already exists')) console.log('Note (trigger):', err.message); });
+        };
+        statusGuard('invoices', 'status', ['DRAFT', 'SENT', 'OVERDUE', 'PAID', 'VOID']);
+        statusGuard('contracts', 'status', ['draft', 'sent', 'signed']);
+        statusGuard('payment_schedules', 'status', ['pending', 'paid', 'overdue', 'superseded', 'cancelled']);
+        statusGuard('payment_schedules', 'source', ['auto', 'client', 'admin']);
+        statusGuard('quotations', 'status', ['draft', 'sent', 'accepted', 'void', 'archived']);
+        // Mirrors VALID_EVENT_STATUSES in server.js — events.event_status had no DB-level guard at all
+        // (unlike invoices/contracts/payment_schedules/quotations above), so a bad literal from any of
+        // the several write paths that bypass the app-level whitelist (see server.js) would persist silently.
+        statusGuard('events', 'event_status', ['upcoming', 'draft', 'live', 'completed', 'cancelled', 'postponed', 'sold_out']);
+        // Rate card 2026: the pricing-type vocabulary (mirrors PRICE_TYPES / PRICE_UNITS in lib/service-pricing.js).
+        statusGuard('services', 'price_type', ['fixed', 'range', 'from', 'enquire', 'enquire_min']);
+        statusGuard('services', 'price_unit', ['minute', 'hour', 'month', 'session', 'draft']);
+
+        // Seed initial schema_migrations entries (idempotent)
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (1, 'initial_tables')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (2, 'add_clients_venues_quotations')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (3, 'add_events_audit_triggers_indexes')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (4, 'add_notifications_schema_migrations')`);
+        // Versions 5-49: Retroactively document ALTER TABLE operations and audit remediation (2026-06-19).
+        // All use INSERT OR IGNORE so re-running is safe (idempotent).
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (5, 'add_contracts_signed_by_uploaded_by_signed_date')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (6, 'add_bookings_client_id_venue_id_google_event_id')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (7, 'add_quotations_version_archived_sent_at_file_path')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (8, 'add_invoices_file_path_notes_sent_at_reminders')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (9, 'add_transactions_source_is_duplicate_reconcile_reference')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (10, 'add_bookings_cancellation_fields_vat_admin_notes')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (11, 'add_cancellations_admin_id_refund_tracking')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (12, 'add_date_holds_event_block_type_google_event_id')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (13, 'add_bookings_event_id_show_on_website_acceptance_fields')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (14, 'add_bookings_deposit_balance_reminded_rebooked_from')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (15, 'add_bookings_performance_times_review_email_attachment')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (16, 'add_bookings_modified_on_buffer_minutes_quote_expiry_warned')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (17, 'add_working_hours_consent_audit_analytics_tables')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (18, 'add_booking_notes_reminders_log_payment_logs')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (19, 'add_sars_rates_expenses_service_reviews')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (20, 'add_bookings_payment_method_raw_data_popia')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (21, 'add_bookings_source_referrer_quotation_id')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (22, 'add_payment_schedules_invoice_id')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (23, 'add_invoices_replacement_invoice_id')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (24, 'add_booking_triggers_recalc_outstanding_auto_payment_status')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (25, 'audit_2026_status_check_constraint_triggers')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (26, 'audit_2026_orphan_protection_triggers')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (27, 'audit_2026_payment_status_machine_fix')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (28, 'audit_2026_remove_confirmed_from_manual_booking_creation')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (29, 'audit_2026_quote_line_item_delete_error_callbacks')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (30, 'audit_2026_invoice_guard_unaccepted_quote')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (31, 'audit_2026_complete_guard_outstanding_balance')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (32, 'audit_2026_admin_booking_performance_end_time')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (33, 'audit_2026_ledger_reconciliation_endpoint')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (34, 'audit_2026_stalled_booking_admin_alert_job')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (35, 'audit_2026_auto_event_creation_on_confirmed')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (36, 'audit_2026_quote_details_write_removed')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (37, 'audit_2026_invoice_status_casing_fix_admin_html')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (38, 'audit_2026_manual_booking_validation_admin_html')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (39, 'audit_2026_quote_builder_line_item_validation')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (40, 'audit_2026_complete_migrations_tracking')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (41, 'audit_2026_cancel_route_audit_log')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (42, 'audit_2026_complete_route_audit_log')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (43, 'inquiries_status_triggers_audit_indexes')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (44, 'inquiries_assignment')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (45, 'inquiries_priority')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (46, 'inquiry_notes')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (47, 'inquiries_bookings_conversion_link')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (48, 'inquiries_sla_response_tracking')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (50, 'status_guard_triggers_invoices_contracts_schedules_quotations')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (51, 'contracts_amount_snapshot_source_quote_link')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (52, 'contracts_integrity_verified_flag')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (53, 'contracts_number_column_for_invoice_citation')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (54, 'bookings_disposition_soft_decline')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (55, 'bookings_alt_dates_content_notes_heard_about')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (56, 'events_status_guard_date_holds_audit_trail')`);
+        db.run(`INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (99, 'full_schema_history_reconstructed_2026_06_19')`);
+        // END schema_migrations seeds
+
+        // Contract management columns
+        db.run("ALTER TABLE contracts ADD COLUMN signed_by TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: contracts.signed_by already exists or error: " + err.message); });
+        db.run("ALTER TABLE contracts ADD COLUMN uploaded_by TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: contracts.uploaded_by already exists or error: " + err.message); });
+        db.run("ALTER TABLE contracts ADD COLUMN signed_date TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: contracts.signed_date already exists or error: " + err.message); });
+        // Contract Builder: JSON snapshot of the last-submitted/resolved clause text (parties/fee/cancellation/etc.),
+        // so re-opening the editor on an unsigned draft restores prior edits instead of resetting to raw defaults.
+        db.run("ALTER TABLE contracts ADD COLUMN builder_clauses TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: contracts.builder_clauses already exists or error: " + err.message); });
+        // Contract↔quote link + amount snapshot (migration 51). Captured at generate time so the
+        // contract stays traceable to the quote it embodies, and a drift between this figure and the
+        // booking's current total (e.g. after a re-quote) can be detected and warned on.
+        db.run("ALTER TABLE contracts ADD COLUMN contract_amount DECIMAL(10,2)", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: contracts.contract_amount already exists or error: " + err.message); });
+        db.run("ALTER TABLE contracts ADD COLUMN source_quote_number TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: contracts.source_quote_number already exists or error: " + err.message); });
+        // Migration 52: surfaces the countersign-time PDF-hash comparison (previously logged only to
+        // audit_log) directly on the row, so the admin UI can show it without a separate lookup.
+        // NULL = not yet checked (no client hash to compare against, e.g. force-countersigned before
+        // the client signed); 1 = hash matched; 0 = mismatch — the PDF changed after the client signed.
+        db.run("ALTER TABLE contracts ADD COLUMN integrity_verified INTEGER", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: contracts.integrity_verified already exists or error: " + err.message); });
+        // Migration 53: the human-facing contract number (e.g. AGR-2026-0042) previously only ever
+        // existed transiently inside generateContract() as a local variable, baked into the PDF
+        // filename but never stored on the row — so nothing else could cite it. Storing it lets
+        // generateInvoice() look it up and print "Issued under Agreement AGR-…" on invoice PDFs
+        // generated after the contract exists (older contracts predating this column just show
+        // nothing, same optional-citation pattern as contracts.source_quote_number).
+        db.run("ALTER TABLE contracts ADD COLUMN contract_number TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: contracts.contract_number already exists or error: " + err.message); });
+
+        // Migration 54 — booking triage (soft-decline). Orthogonal to `status`/ALLOWED_TRANSITIONS:
+        // dispositioning a fresh enquiry as "not a fit" or "archived" is a simple UPDATE, not a
+        // pipeline transition, so a bad-fit lead can be declined without it reading as a cancelled
+        // deal and without polluting conversion analytics (mirrors the existing status/payment_status
+        // two-axis pattern). NULL/legacy rows are treated as 'active' everywhere they're read.
+        db.run("ALTER TABLE bookings ADD COLUMN disposition TEXT DEFAULT 'active'", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: bookings.disposition already exists or error: " + err.message); });
+        db.run("CREATE INDEX IF NOT EXISTS idx_bookings_disposition ON bookings(disposition)");
+
+        // Migration 55 — public booking form fields: alternative/backup dates, a content-suitability
+        // note, and an optional self-reported "how did you hear about us" (kept alongside the
+        // existing auto-captured source/referrer, not a replacement for them). All optional, capped
+        // via BOOKING_TEXT_LIMITS in server.js. `budget_range` already existed — not re-added here.
+        db.run("ALTER TABLE bookings ADD COLUMN alternative_dates TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: bookings.alternative_dates already exists or error: " + err.message); });
+        db.run("ALTER TABLE bookings ADD COLUMN content_notes TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: bookings.content_notes already exists or error: " + err.message); });
+        db.run("ALTER TABLE bookings ADD COLUMN heard_about TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: bookings.heard_about already exists or error: " + err.message); });
+
+        // Reconciliation columns for transactions
+        db.run("ALTER TABLE transactions ADD COLUMN source TEXT DEFAULT 'manual'", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: transactions.source already exists or error: " + err.message); });
+        db.run("ALTER TABLE transactions ADD COLUMN is_duplicate INTEGER DEFAULT 0", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: transactions.is_duplicate already exists or error: " + err.message); });
+        db.run("ALTER TABLE transactions ADD COLUMN reconcile_note TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: transactions.reconcile_note already exists or error: " + err.message); });
+        // Proof-of-payment attachment for manually-recorded payments (EFT/cash) — required before a
+        // manual payment can be saved; not applicable to PayFast transactions (the gateway is its own proof).
+        db.run("ALTER TABLE transactions ADD COLUMN proof_of_payment_path TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: transactions.proof_of_payment_path already exists or error: " + err.message); });
+
+        // Services catalogue — active/inactive toggle
+        db.run("ALTER TABLE services ADD COLUMN is_active INTEGER DEFAULT 1", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: services.is_active already exists or error: " + err.message); });
+
+        // C7: Client-submitted post-event reviews
+        db.run(`CREATE TABLE IF NOT EXISTS service_reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            booking_id INTEGER NOT NULL UNIQUE,
+            client_name TEXT,
+            rating INTEGER NOT NULL CHECK(rating BETWEEN 1 AND 5),
+            review_text TEXT,
+            is_approved INTEGER DEFAULT 0,
+            submitted_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(booking_id) REFERENCES bookings(id) ON DELETE CASCADE
+        )`, (err) => { if (err) console.error('Error creating service_reviews table:', err.message); });
+
+        // Audit log missing columns
+        db.run("ALTER TABLE audit_log ADD COLUMN changed_by TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: audit_log.changed_by already exists or error: " + err.message); });
+        db.run("ALTER TABLE audit_log ADD COLUMN changes_json TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: audit_log.changes_json already exists or error: " + err.message); });
+        // "Last Updated By" feature: role-at-time-of-action snapshot. Populated going forward only —
+        // rows written before this migration show NULL ("—" in the UI), which is honest since we have
+        // no way to know a historical actor's role retroactively.
+        db.run("ALTER TABLE audit_log ADD COLUMN actor_role TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: audit_log.actor_role already exists or error: " + err.message); });
+
+        // Indexes for performance
+        db.run(`CREATE INDEX IF NOT EXISTS idx_audit_table_record ON audit_log(table_name, record_id)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_transactions_booking ON transactions(booking_id)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_bookings_client ON bookings(client_id)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_bookings_venue ON bookings(venue_id)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_cancellations_booking ON cancellations(booking_id)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_communication_booking ON communication_log(booking_id)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_date_holds_active ON date_holds(comedian_id, hold_date) WHERE status = 'active'`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_bookings_email ON bookings(email)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_bookings_payment_status ON bookings(payment_status)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_invoices_booking ON invoices(booking_id)`);
+        db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_services_name ON services(name)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_transactions_reference ON transactions(reference)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_transactions_source ON transactions(source)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_payment_logs_booking ON payment_logs(booking_id)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_events_datetime ON events(event_datetime)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_events_status ON events(event_status)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_events_booking ON events(booking_id)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_events_venue ON events(venue_id)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_events_gcal ON events(google_calendar_event_id)`);
+
+        // booking_services had NO index despite ON DELETE CASCADE from bookings and frequent
+        // joins on booking_id (invoice/quote generation, milestone reads).
+        db.run(`CREATE INDEX IF NOT EXISTS idx_booking_services_booking ON booking_services(booking_id)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_booking_line_items_booking ON booking_line_items(booking_id)`);
+        // The public-intake duplicate check filters on lower(email), which idx_bookings_email(email)
+        // cannot serve — it was a full scan. This expression index matches the (lower(email), date) predicate.
+        db.run(`CREATE INDEX IF NOT EXISTS idx_bookings_email_lower_date ON bookings(lower(email), date)`);
+        // Intake-volume analytics and the recency ordering used across admin lists.
+        db.run(`CREATE INDEX IF NOT EXISTS idx_bookings_created_at ON bookings(created_at)`);
+        // Milestone reads/writes on the payment path.
+        db.run(`CREATE INDEX IF NOT EXISTS idx_payment_schedules_booking ON payment_schedules(booking_id)`);
+        // pf_payment_id is UNIQUE (auto-indexed), but the ITN dedupe pre-check also queries by reference+source.
+        db.run(`CREATE INDEX IF NOT EXISTS idx_transactions_booking_source ON transactions(booking_id, source)`);
+
+        // ==========================================
+        // SEEDING DEFAULT DATA
+        // ==========================================
+        const defaultServices = [
+            ['Stand-Up Performance (60 min)', 'Full headline set', 35000.00, 'flat', null, 1, 'unit', 1, 'Performance', 'core', 30, 60, 'per_day'],
+            ['Stand-Up Performance (45 min)', 'Feature set', 25000.00, 'flat', null, 1, 'unit', 1, 'Performance', 'core', 30, 45, 'per_day'],
+            ['Stand-Up Performance (30 min)', 'Opening set', 15000.00, 'flat', null, 1, 'unit', 1, 'Performance', 'core', 30, 30, 'any_time'],
+            ['MC / Hosting', 'Event hosting and crowd work', 20000.00, 'flat', null, 1, 'unit', 1, 'Performance', 'core', 15, 120, 'any_time'],
+            ['MC / Hosting (Per Minute)', 'Flexible duration hosting', 333.33, 'per_minute', null, 15, 'min', 1, 'Performance', 'core', 15, 15, 'any_time'],
+            ['Travel Buyout (Gauteng)', 'Travel within Gauteng province', 2500.00, 'flat', null, 1, 'unit', 0, 'Travel', 'add-on', 0, 0, 'any_time'],
+            ['Travel Buyout (National)', 'Travel anywhere in South Africa', 5000.00, 'flat', null, 1, 'unit', 0, 'Travel', 'add-on', 0, 0, 'any_time']
+        ];
+        defaultServices.forEach(s => {
+            db.run(`INSERT OR IGNORE INTO services (name, description, default_price, pricing_model, base_price, min_quantity, display_unit, is_taxable, category, service_type, setup_time_minutes, performance_length_minutes, availability_rule) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, s);
+        });
+
+        const defaultPolicies = [
+            ['cancellation_policy', 'Cancellations made 30+ days before the event receive a full refund minus a 10% admin fee. Cancellations 14-29 days receive 50% refund. Cancellations within 14 days are non-refundable.'],
+            ['deposit_percentage', '50'],
+            ['quote_validity_days', '7'],
+            ['payment_terms', '50% non-refundable deposit due upon acceptance of quote. Remaining balance due 48 hours before the event.'],
+            ['inquiry_response_sla_hours', '24'],
+            // Client payment plans (lib/payment-plan.js): the smallest payment, in rands, a client may
+            // schedule when splitting their balance. A single remaining payment is exempt.
+            ['min_installment_amount', '500']
+        ];
+        defaultPolicies.forEach(p => {
+            db.run(`INSERT OR IGNORE INTO policies (policy_key, policy_value) VALUES (?, ?)`, p);
+        });
+
+        // ==========================================
+        // AUDIT TRIGGERS
+        // ==========================================
+        db.run(`CREATE TRIGGER IF NOT EXISTS audit_bookings_insert AFTER INSERT ON bookings
+        BEGIN
+            INSERT INTO audit_log (table_name, record_id, action, new_values, changed_by, change_timestamp)
+            VALUES ('bookings', NEW.id, 'INSERT',
+                json_object('name', NEW.name, 'email', NEW.email, 'date', NEW.date, 'status', NEW.status),
+                'public', CURRENT_TIMESTAMP);
+        END`);
+
+        // "Last Updated By" feature: DROP+recreate (CREATE TRIGGER IF NOT EXISTS is a silent no-op on an
+        // already-existing trigger, so the DROP is required for this edit to actually take effect on any
+        // database that's already booted once). Now captures changed_by/actor_role/change_timestamp,
+        // which the original version never did at all.
+        // "Last Updated By" feature: widened from {status, total_fee, event_date} only — this trigger
+        // fires on EVERY bookings UPDATE regardless of which route/columns actually changed (venue
+        // link, date drag, disposition, payment fields, etc.), so a narrow capture meant almost every
+        // real row in the live DB showed identical old/new values for its 3 tracked fields even though
+        // something genuinely changed — the Change History card then had nothing to diff and rendered
+        // empty. Wide enough to cover the fields the admin routes actually touch, while still excluding
+        // large free-text/blob columns (message, admin_notes, quote_details, attachment_files, raw
+        // payment payloads) that would make the diff card unreadable.
+        db.run("DROP TRIGGER IF EXISTS audit_bookings_update");
+        db.run(`CREATE TRIGGER IF NOT EXISTS audit_bookings_update AFTER UPDATE ON bookings
+        BEGIN
+            INSERT INTO audit_log (table_name, record_id, action, old_values, new_values, changed_by, actor_role, change_timestamp)
+            VALUES ('bookings', NEW.id, 'UPDATE',
+                json_object('status', OLD.status, 'total_fee', OLD.total_amount, 'event_date', OLD.date,
+                    'event_start_time', OLD.event_start_time, 'performance_end_time', OLD.performance_end_time,
+                    'payment_status', OLD.payment_status, 'amount_paid', OLD.amount_paid, 'amount_outstanding', OLD.amount_outstanding,
+                    'venue_id', OLD.venue_id, 'city', OLD.city, 'event_location', OLD.event_location,
+                    'is_public', OLD.is_public, 'disposition', OLD.disposition,
+                    'cancellation_reason', OLD.cancellation_reason, 'quote_expiry_date', OLD.quote_expiry_date,
+                    'buffer_minutes', OLD.buffer_minutes),
+                json_object('status', NEW.status, 'total_fee', NEW.total_amount, 'event_date', NEW.date,
+                    'event_start_time', NEW.event_start_time, 'performance_end_time', NEW.performance_end_time,
+                    'payment_status', NEW.payment_status, 'amount_paid', NEW.amount_paid, 'amount_outstanding', NEW.amount_outstanding,
+                    'venue_id', NEW.venue_id, 'city', NEW.city, 'event_location', NEW.event_location,
+                    'is_public', NEW.is_public, 'disposition', NEW.disposition,
+                    'cancellation_reason', NEW.cancellation_reason, 'quote_expiry_date', NEW.quote_expiry_date,
+                    'buffer_minutes', NEW.buffer_minutes),
+                CAST(NEW.modified_by AS TEXT), NEW.modified_by_role, CURRENT_TIMESTAMP);
+        END`);
+
+        db.run(`CREATE TRIGGER IF NOT EXISTS audit_invoices_update AFTER UPDATE ON invoices
+        BEGIN
+            INSERT INTO audit_log (table_name, record_id, action, old_values, new_values)
+            VALUES ('invoices', NEW.id, 'UPDATE',
+                json_object('status', OLD.status, 'total_amount', OLD.total_amount),
+                json_object('status', NEW.status, 'total_amount', NEW.total_amount));
+        END`);
+
+        db.run(`CREATE TRIGGER IF NOT EXISTS audit_transactions_insert AFTER INSERT ON transactions
+        BEGIN
+            INSERT INTO audit_log (table_name, record_id, action, new_values)
+            VALUES ('transactions', NEW.id, 'INSERT',
+                json_object('amount', NEW.amount, 'type', NEW.transaction_type, 'status', NEW.status));
+        END`);
+
+        db.run(`CREATE TRIGGER IF NOT EXISTS audit_cancellations_insert AFTER INSERT ON cancellations
+        BEGIN
+            INSERT INTO audit_log (table_name, record_id, action, new_values)
+            VALUES ('cancellations', NEW.id, 'INSERT',
+                json_object('booking_id', NEW.booking_id, 'cancelled_by', NEW.cancelled_by, 'refund_due', NEW.refund_due));
+        END`, (err) => { if (err) console.error("Error creating audit_cancellations_insert trigger:", err.message); });
+
+        db.run(`CREATE TRIGGER IF NOT EXISTS audit_events_insert AFTER INSERT ON events
+        BEGIN
+            INSERT INTO audit_log (table_name, record_id, action, new_values, changed_by, change_timestamp)
+            VALUES ('events', NEW.event_id, 'INSERT',
+                json_object('event_title', NEW.event_title, 'event_datetime', NEW.event_datetime, 'event_status', NEW.event_status, 'booking_id', NEW.booking_id),
+                CAST(NEW.created_by AS TEXT), CURRENT_TIMESTAMP);
+        END`, (err) => { if (err) console.error("Error creating audit_events_insert trigger:", err.message); });
+
+        // "Last Updated By" feature: DROP+recreate so the edit actually takes effect (CREATE TRIGGER IF
+        // NOT EXISTS is a no-op otherwise). Adds actor_role alongside the changed_by this trigger already
+        // captured, and widens the captured fields beyond title/datetime/status — the full-form Events
+        // edit route updates venue/capacity/cancellation fields too, and a narrow capture meant editing
+        // just those left the Change History card's diff empty even though the save genuinely changed
+        // something.
+        db.run("DROP TRIGGER IF EXISTS audit_events_update");
+        db.run(`CREATE TRIGGER IF NOT EXISTS audit_events_update AFTER UPDATE ON events
+        BEGIN
+            INSERT INTO audit_log (table_name, record_id, action, old_values, new_values, changed_by, actor_role, change_timestamp)
+            VALUES ('events', NEW.event_id, 'UPDATE',
+                json_object('event_title', OLD.event_title, 'event_datetime', OLD.event_datetime, 'event_status', OLD.event_status,
+                    'venue_name', OLD.venue_name, 'venue_id', OLD.venue_id, 'event_capacity', OLD.event_capacity,
+                    'cancellation_reason', OLD.cancellation_reason, 'booking_id', OLD.booking_id),
+                json_object('event_title', NEW.event_title, 'event_datetime', NEW.event_datetime, 'event_status', NEW.event_status,
+                    'venue_name', NEW.venue_name, 'venue_id', NEW.venue_id, 'event_capacity', NEW.event_capacity,
+                    'cancellation_reason', NEW.cancellation_reason, 'booking_id', NEW.booking_id),
+                CAST(NEW.modified_by AS TEXT), NEW.modified_by_role, CURRENT_TIMESTAMP);
+        END`, (err) => { if (err) console.error("Error creating audit_events_update trigger:", err.message); });
+
+        db.run(`CREATE TRIGGER IF NOT EXISTS audit_events_delete AFTER DELETE ON events
+        BEGIN
+            INSERT INTO audit_log (table_name, record_id, action, old_values, change_timestamp)
+            VALUES ('events', OLD.event_id, 'DELETE',
+                json_object('event_title', OLD.event_title, 'event_datetime', OLD.event_datetime, 'event_status', OLD.event_status, 'booking_id', OLD.booking_id),
+                CURRENT_TIMESTAMP);
+        END`, (err) => { if (err) console.error("Error creating audit_events_delete trigger:", err.message); });
+
+        // date_holds had no audit trail at all (unlike events above) — every calendar block
+        // create/move/release was invisible to audit_log.
+        // "Last Updated By" feature: DROP+recreate so the edit takes effect; adds changed_by, which this
+        // trigger never captured before (now that date_holds has a created_by column to read).
+        db.run("DROP TRIGGER IF EXISTS audit_date_holds_insert");
+        db.run(`CREATE TRIGGER IF NOT EXISTS audit_date_holds_insert AFTER INSERT ON date_holds
+        BEGIN
+            INSERT INTO audit_log (table_name, record_id, action, new_values, changed_by, change_timestamp)
+            VALUES ('date_holds', NEW.id, 'INSERT',
+                json_object('hold_date', NEW.hold_date, 'status', NEW.status, 'block_type', NEW.block_type, 'notes', NEW.notes),
+                CAST(NEW.created_by AS TEXT), CURRENT_TIMESTAMP);
+        END`, (err) => { if (err) console.error("Error creating audit_date_holds_insert trigger:", err.message); });
+
+        // "Last Updated By" feature: DROP+recreate so the edit takes effect; adds changed_by/actor_role,
+        // which this trigger never captured before.
+        db.run("DROP TRIGGER IF EXISTS audit_date_holds_update");
+        db.run(`CREATE TRIGGER IF NOT EXISTS audit_date_holds_update AFTER UPDATE ON date_holds
+        BEGIN
+            INSERT INTO audit_log (table_name, record_id, action, old_values, new_values, changed_by, actor_role, change_timestamp)
+            VALUES ('date_holds', NEW.id, 'UPDATE',
+                json_object('hold_date', OLD.hold_date, 'status', OLD.status),
+                json_object('hold_date', NEW.hold_date, 'status', NEW.status),
+                CAST(NEW.updated_by AS TEXT), NEW.updated_by_role, CURRENT_TIMESTAMP);
+        END`, (err) => { if (err) console.error("Error creating audit_date_holds_update trigger:", err.message); });
+
+        db.run(`CREATE TRIGGER IF NOT EXISTS audit_date_holds_delete AFTER DELETE ON date_holds
+        BEGIN
+            INSERT INTO audit_log (table_name, record_id, action, old_values, change_timestamp)
+            VALUES ('date_holds', OLD.id, 'DELETE',
+                json_object('hold_date', OLD.hold_date, 'status', OLD.status, 'block_type', OLD.block_type, 'notes', OLD.notes),
+                CURRENT_TIMESTAMP);
+        END`, (err) => { if (err) console.error("Error creating audit_date_holds_delete trigger:", err.message); });
+
+        db.run(`CREATE TRIGGER IF NOT EXISTS audit_inquiries_insert AFTER INSERT ON inquiries
+        BEGIN
+            INSERT INTO audit_log (table_name, record_id, action, new_values, changed_by, change_timestamp)
+            VALUES ('inquiries', NEW.inquiry_id, 'INSERT',
+                json_object('sender_name', NEW.sender_name, 'sender_email', NEW.sender_email, 'subject', NEW.subject, 'status', NEW.status),
+                'public', CURRENT_TIMESTAMP);
+        END`, (err) => { if (err) console.error("Error creating audit_inquiries_insert trigger:", err.message); });
+
+        // "Last Updated By" feature: extends this trigger (already DROP+recreated for an earlier fix)
+        // with changed_by/actor_role, which it never captured before, and adds category — the
+        // dedicated /category route updates that column but it wasn't captured, so a category-only
+        // edit left the Change History card's diff empty.
+        db.run("DROP TRIGGER IF EXISTS audit_inquiries_update");
+        db.run(`CREATE TRIGGER IF NOT EXISTS audit_inquiries_update AFTER UPDATE ON inquiries
+        BEGIN
+            INSERT INTO audit_log (table_name, record_id, action, old_values, new_values, changed_by, actor_role, change_timestamp)
+            VALUES ('inquiries', NEW.inquiry_id, 'UPDATE',
+                json_object('status', OLD.status, 'assigned_to', OLD.assigned_to, 'priority', OLD.priority, 'category', OLD.category),
+                json_object('status', NEW.status, 'assigned_to', NEW.assigned_to, 'priority', NEW.priority, 'category', NEW.category),
+                CAST(NEW.updated_by AS TEXT), NEW.updated_by_role, CURRENT_TIMESTAMP);
+        END`, (err) => { if (err) console.error("Error creating audit_inquiries_update trigger:", err.message); });
+
+        db.run(`CREATE TRIGGER IF NOT EXISTS audit_inquiries_delete AFTER DELETE ON inquiries
+        BEGIN
+            INSERT INTO audit_log (table_name, record_id, action, old_values, change_timestamp)
+            VALUES ('inquiries', OLD.inquiry_id, 'DELETE',
+                json_object('sender_name', OLD.sender_name, 'sender_email', OLD.sender_email, 'subject', OLD.subject, 'status', OLD.status),
+                CURRENT_TIMESTAMP);
+        END`, (err) => { if (err) console.error("Error creating audit_inquiries_delete trigger:", err.message); });
+
+        // ==========================================
+        // STATUS VALIDATION TRIGGERS (CHECK-constraint equivalents for SQLite)
+        // These fire BEFORE INSERT/UPDATE on status columns to reject invalid values.
+        // 'draft' variants are included as legacy-safe fallbacks for existing rows.
+        // ==========================================
+
+        // bookings.status
+        db.run(`CREATE TRIGGER IF NOT EXISTS chk_bookings_status_insert
+        BEFORE INSERT ON bookings
+        WHEN NEW.status NOT IN ('NEW','PENDING','REVIEWED','QUOTED','ACCEPTED','CONFIRMED','COMPLETED','CANCELLED','EXPIRED')
+        BEGIN SELECT RAISE(ABORT, 'Invalid bookings.status value'); END`);
+
+        db.run(`CREATE TRIGGER IF NOT EXISTS chk_bookings_status_update
+        BEFORE UPDATE OF status ON bookings
+        WHEN NEW.status NOT IN ('NEW','PENDING','REVIEWED','QUOTED','ACCEPTED','CONFIRMED','COMPLETED','CANCELLED','EXPIRED')
+        BEGIN SELECT RAISE(ABORT, 'Invalid bookings.status value'); END`);
+
+        // bookings.payment_status
+        db.run(`CREATE TRIGGER IF NOT EXISTS chk_bookings_payment_status_insert
+        BEFORE INSERT ON bookings
+        WHEN NEW.payment_status NOT IN ('UNPAID','DEPOSIT_PAID','PARTIALLY_PAID','PAID','REFUNDED','FAILED')
+        BEGIN SELECT RAISE(ABORT, 'Invalid bookings.payment_status value'); END`);
+
+        db.run(`CREATE TRIGGER IF NOT EXISTS chk_bookings_payment_status_update
+        BEFORE UPDATE OF payment_status ON bookings
+        WHEN NEW.payment_status NOT IN ('UNPAID','DEPOSIT_PAID','PARTIALLY_PAID','PAID','REFUNDED','FAILED')
+        BEGIN SELECT RAISE(ABORT, 'Invalid bookings.payment_status value'); END`);
+
+        // quotations.status (lowercase convention)
+        db.run(`CREATE TRIGGER IF NOT EXISTS chk_quotations_status_insert
+        BEFORE INSERT ON quotations
+        WHEN NEW.status NOT IN ('draft','sent','accepted','expired','rejected','archived')
+        BEGIN SELECT RAISE(ABORT, 'Invalid quotations.status value'); END`);
+
+        db.run(`CREATE TRIGGER IF NOT EXISTS chk_quotations_status_update
+        BEFORE UPDATE OF status ON quotations
+        WHEN NEW.status NOT IN ('draft','sent','accepted','expired','rejected','archived')
+        BEGIN SELECT RAISE(ABORT, 'Invalid quotations.status value'); END`);
+
+        // invoices.status (mixed casing — UPPERCASE for new rows, 'draft' kept for legacy rows)
+        db.run(`CREATE TRIGGER IF NOT EXISTS chk_invoices_status_insert
+        BEFORE INSERT ON invoices
+        WHEN NEW.status NOT IN ('draft','DRAFT','sent','SENT','overdue','OVERDUE','paid','PAID','void','VOID','partially_paid','PARTIALLY_PAID')
+        BEGIN SELECT RAISE(ABORT, 'Invalid invoices.status value'); END`);
+
+        db.run(`CREATE TRIGGER IF NOT EXISTS chk_invoices_status_update
+        BEFORE UPDATE OF status ON invoices
+        WHEN NEW.status NOT IN ('draft','DRAFT','sent','SENT','overdue','OVERDUE','paid','PAID','void','VOID','partially_paid','PARTIALLY_PAID')
+        BEGIN SELECT RAISE(ABORT, 'Invalid invoices.status value'); END`);
+
+        // transactions.status (lowercase convention)
+        db.run(`CREATE TRIGGER IF NOT EXISTS chk_transactions_status_insert
+        BEFORE INSERT ON transactions
+        WHEN NEW.status NOT IN ('pending','completed','failed','cancelled','refunded')
+        BEGIN SELECT RAISE(ABORT, 'Invalid transactions.status value'); END`);
+
+        db.run(`CREATE TRIGGER IF NOT EXISTS chk_transactions_status_update
+        BEFORE UPDATE OF status ON transactions
+        WHEN NEW.status NOT IN ('pending','completed','failed','cancelled','refunded')
+        BEGIN SELECT RAISE(ABORT, 'Invalid transactions.status value'); END`);
+
+        // payment_schedules.status (lowercase convention)
+        db.run("DROP TRIGGER IF EXISTS chk_payment_schedules_status_insert");
+        db.run("DROP TRIGGER IF EXISTS chk_payment_schedules_status_update");
+
+        db.run(`CREATE TRIGGER IF NOT EXISTS chk_payment_schedules_status_insert
+        BEFORE INSERT ON payment_schedules
+        WHEN NEW.status NOT IN ('pending','due_soon','overdue','paid','cancelled','superseded')
+        BEGIN SELECT RAISE(ABORT, 'Invalid payment_schedules.status value'); END`);
+
+        db.run(`CREATE TRIGGER IF NOT EXISTS chk_payment_schedules_status_update
+        BEFORE UPDATE OF status ON payment_schedules
+        WHEN NEW.status NOT IN ('pending','due_soon','overdue','paid','cancelled','superseded')
+        BEGIN SELECT RAISE(ABORT, 'Invalid payment_schedules.status value'); END`);
+
+        // date_holds.status (lowercase convention)
+        db.run(`CREATE TRIGGER IF NOT EXISTS chk_date_holds_status_insert
+        BEFORE INSERT ON date_holds
+        WHEN NEW.status NOT IN ('active','expired','converted','cancelled')
+        BEGIN SELECT RAISE(ABORT, 'Invalid date_holds.status value'); END`);
+
+        db.run(`CREATE TRIGGER IF NOT EXISTS chk_date_holds_status_update
+        BEFORE UPDATE OF status ON date_holds
+        WHEN NEW.status NOT IN ('active','expired','converted','cancelled')
+        BEGIN SELECT RAISE(ABORT, 'Invalid date_holds.status value'); END`);
+
+        // contracts.status (lowercase convention)
+        db.run(`CREATE TRIGGER IF NOT EXISTS chk_contracts_status_insert
+        BEFORE INSERT ON contracts
+        WHEN NEW.status NOT IN ('draft','sent','signed','active','expired','voided')
+        BEGIN SELECT RAISE(ABORT, 'Invalid contracts.status value'); END`);
+
+        db.run(`CREATE TRIGGER IF NOT EXISTS chk_contracts_status_update
+        BEFORE UPDATE OF status ON contracts
+        WHEN NEW.status NOT IN ('draft','sent','signed','active','expired','voided')
+        BEGIN SELECT RAISE(ABORT, 'Invalid contracts.status value'); END`);
+
+        // cancellations.refund_status (lowercase convention)
+        db.run(`CREATE TRIGGER IF NOT EXISTS chk_cancellations_refund_status_insert
+        BEFORE INSERT ON cancellations
+        WHEN NEW.refund_status NOT IN ('pending','processing','processed','failed','cancelled')
+        BEGIN SELECT RAISE(ABORT, 'Invalid cancellations.refund_status value'); END`);
+
+        db.run(`CREATE TRIGGER IF NOT EXISTS chk_cancellations_refund_status_update
+        BEFORE UPDATE OF refund_status ON cancellations
+        WHEN NEW.refund_status NOT IN ('pending','processing','processed','failed','cancelled')
+        BEGIN SELECT RAISE(ABORT, 'Invalid cancellations.refund_status value'); END`);
+
+        // inquiries.status (lowercase convention)
+        db.run(`CREATE TRIGGER IF NOT EXISTS chk_inquiries_status_insert
+        BEFORE INSERT ON inquiries
+        WHEN NEW.status NOT IN ('unread','read','replied','archived')
+        BEGIN SELECT RAISE(ABORT, 'Invalid inquiries.status value'); END`);
+
+        db.run(`CREATE TRIGGER IF NOT EXISTS chk_inquiries_status_update
+        BEFORE UPDATE OF status ON inquiries
+        WHEN NEW.status NOT IN ('unread','read','replied','archived')
+        BEGIN SELECT RAISE(ABORT, 'Invalid inquiries.status value'); END`);
+
+        // inquiries.priority (mirrors notifications.priority's enum for consistency)
+        db.run(`CREATE TRIGGER IF NOT EXISTS chk_inquiries_priority_insert
+        BEFORE INSERT ON inquiries
+        WHEN NEW.priority NOT IN ('low','normal','high','urgent')
+        BEGIN SELECT RAISE(ABORT, 'Invalid inquiries.priority value'); END`);
+
+        db.run(`CREATE TRIGGER IF NOT EXISTS chk_inquiries_priority_update
+        BEFORE UPDATE OF priority ON inquiries
+        WHEN NEW.priority NOT IN ('low','normal','high','urgent')
+        BEGIN SELECT RAISE(ABORT, 'Invalid inquiries.priority value'); END`);
+
+        // ==========================================
+        // ORPHAN PROTECTION TRIGGERS
+        // SQLite cannot add ON DELETE RESTRICT after table creation, so these BEFORE DELETE
+        // triggers prevent booking deletion when financial records exist, mirroring that intent.
+        // ==========================================
+
+        db.run(`CREATE TRIGGER IF NOT EXISTS protect_booking_delete_invoices
+        BEFORE DELETE ON bookings
+        WHEN (SELECT COUNT(*) FROM invoices WHERE booking_id = OLD.id) > 0
+        BEGIN SELECT RAISE(ABORT, 'Cannot delete booking: financial records (invoices) exist. Void the invoice first.'); END`);
+
+        db.run(`CREATE TRIGGER IF NOT EXISTS protect_booking_delete_transactions
+        BEFORE DELETE ON bookings
+        WHEN (SELECT COUNT(*) FROM transactions WHERE booking_id = OLD.id) > 0
+        BEGIN SELECT RAISE(ABORT, 'Cannot delete booking: financial records (transactions) exist.'); END`);
+
+        db.run(`CREATE TRIGGER IF NOT EXISTS protect_booking_delete_contracts
+        BEFORE DELETE ON bookings
+        WHEN (SELECT COUNT(*) FROM contracts WHERE booking_id = OLD.id) > 0
+        BEGIN SELECT RAISE(ABORT, 'Cannot delete booking: a contract exists for this booking.'); END`);
+
+        db.run(`CREATE TRIGGER IF NOT EXISTS protect_booking_delete_quotations
+        BEFORE DELETE ON bookings
+        WHEN (SELECT COUNT(*) FROM quotations WHERE booking_id = OLD.id) > 0
+        BEGIN SELECT RAISE(ABORT, 'Cannot delete booking: quotation records exist for this booking.'); END`);
+
+        // Booking scheduling defaults — only inserted once; admin can update via settings UI
+        db.run(`INSERT OR IGNORE INTO settings (setting_key, setting_value) VALUES ('working_hours_start', '09:00')`);
+        db.run(`INSERT OR IGNORE INTO settings (setting_key, setting_value) VALUES ('working_hours_end', '22:00')`);
+        db.run(`INSERT OR IGNORE INTO settings (setting_key, setting_value) VALUES ('min_booking_gap_minutes', '30')`);
+
+        // Per-day-of-week working hours (0=Sunday … 6=Saturday)
+        db.run(`CREATE TABLE IF NOT EXISTS working_hours (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            day_of_week INTEGER NOT NULL CHECK(day_of_week BETWEEN 0 AND 6),
+            start_time  TEXT NOT NULL DEFAULT '09:00',
+            end_time    TEXT NOT NULL DEFAULT '22:00',
+            is_working_day INTEGER NOT NULL DEFAULT 1,
+            UNIQUE(day_of_week)
+        )`, () => {
+            // Seed defaults for all 7 days if not yet present
+            const days = [0,1,2,3,4,5,6];
+            days.forEach(d => {
+                db.run(`INSERT OR IGNORE INTO working_hours (day_of_week, start_time, end_time, is_working_day)
+                        VALUES (?, '09:00', '22:00', 1)`, [d]);
+            });
+        });
+
+        // Immutable audit trail for POPIA/GDPR consent records
+        db.run(`CREATE TABLE IF NOT EXISTS consent_audit (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            booking_id  INTEGER NOT NULL,
+            ip_address  TEXT,
+            user_agent  TEXT,
+            policy_version TEXT,
+            consented_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (booking_id) REFERENCES bookings(id)
+        )`, () => {
+            db.run("ALTER TABLE consent_audit ADD COLUMN policy_version TEXT", () => {});
+        });
+        db.run(`CREATE INDEX IF NOT EXISTS idx_consent_audit_booking ON consent_audit(booking_id)`);
+
+        // ============================================================
+        // POPIA Data Erasure — the "request" record for the right-to-erasure workflow.
+        // Deliberately NOT the same table as audit_log: this one has a mutable lifecycle
+        // status (pending -> approved/rejected -> processing -> processed/failed) that a
+        // pure append-only audit log can't represent. Every lifecycle transition still writes
+        // its own row to the existing audit_log table (table_name='popia_erasure_requests',
+        // record_id=this row's id) — this table is the searchable/reviewable request queue,
+        // audit_log remains the immutable trail of what happened and when.
+        // ============================================================
+        db.run(`CREATE TABLE IF NOT EXISTS popia_erasure_requests (
+            id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+            reference_number            TEXT UNIQUE,
+            email                       TEXT NOT NULL,
+            reason                      TEXT NOT NULL CHECK(reason IN (
+                                            'no_longer_a_client','privacy_concerns','no_longer_wish_to_be_contacted',
+                                            'duplicate_or_test_submission','incorrect_information_on_file','other'
+                                        )),
+            reason_other_text           TEXT,
+            additional_comments         TEXT,
+            consequences_acknowledged   INTEGER NOT NULL DEFAULT 0 CHECK(consequences_acknowledged IN (0,1)),
+            source                      TEXT NOT NULL DEFAULT 'public' CHECK(source IN ('public','admin')),
+            status                      TEXT NOT NULL DEFAULT 'pending',
+            requested_at                DATETIME DEFAULT CURRENT_TIMESTAMP,
+            requested_ip                TEXT,
+            requested_user_agent        TEXT,
+            reviewed_by                 INTEGER REFERENCES admins(id),
+            reviewed_by_name            TEXT,
+            reviewed_at                 DATETIME,
+            review_notes                TEXT,
+            processed_by                INTEGER REFERENCES admins(id),
+            processed_by_name           TEXT,
+            processed_at                DATETIME,
+            affected_tables_json        TEXT,
+            error_message               TEXT,
+            updated_at                  DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`, () => {});
+        db.run(`CREATE INDEX IF NOT EXISTS idx_popia_requests_email       ON popia_erasure_requests(email)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_popia_requests_status     ON popia_erasure_requests(status)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_popia_requests_requested_at ON popia_erasure_requests(requested_at)`);
+
+        // One-time defensive rebuild: popia_erasure_requests.status originally shipped with an INLINE
+        // CHECK (baked in forever) instead of the trigger-based pattern used by transactions.status/
+        // contracts.status/bookings.status/etc — moved to triggers below so 'awaiting_refund' (and any
+        // future value) can be added without another rebuild. Self-verifying against the stored CREATE
+        // TABLE sql, same shape as the banners.category migration above (PRAGMA foreign_keys off/on,
+        // full BEGIN/CREATE-new/COPY/DROP/RENAME/COMMIT) — safe to run on every boot, a no-op once done.
+        db.get("SELECT sql FROM sqlite_master WHERE type='table' AND name='popia_erasure_requests'", (sqlErr, row) => {
+            if (sqlErr || !row || !row.sql.includes("CHECK(status IN")) return;
+            console.log('[migration] Removing inline status CHECK from popia_erasure_requests (moving to triggers)...');
+            db.run("PRAGMA foreign_keys=OFF", () => {
+                db.run("BEGIN TRANSACTION", (beginErr) => {
+                    if (beginErr) { console.error('[migration] BEGIN failed:', beginErr.message); return; }
+                    db.run(`CREATE TABLE popia_erasure_requests_new (
+                        id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+                        reference_number            TEXT UNIQUE,
+                        email                       TEXT NOT NULL,
+                        reason                      TEXT NOT NULL CHECK(reason IN (
+                                                        'no_longer_a_client','privacy_concerns','no_longer_wish_to_be_contacted',
+                                                        'duplicate_or_test_submission','incorrect_information_on_file','other'
+                                                    )),
+                        reason_other_text           TEXT,
+                        additional_comments         TEXT,
+                        consequences_acknowledged   INTEGER NOT NULL DEFAULT 0 CHECK(consequences_acknowledged IN (0,1)),
+                        source                      TEXT NOT NULL DEFAULT 'public' CHECK(source IN ('public','admin')),
+                        status                      TEXT NOT NULL DEFAULT 'pending',
+                        requested_at                DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        requested_ip                TEXT,
+                        requested_user_agent        TEXT,
+                        reviewed_by                 INTEGER REFERENCES admins(id),
+                        reviewed_by_name            TEXT,
+                        reviewed_at                 DATETIME,
+                        review_notes                TEXT,
+                        processed_by                INTEGER REFERENCES admins(id),
+                        processed_by_name           TEXT,
+                        processed_at                DATETIME,
+                        affected_tables_json        TEXT,
+                        error_message               TEXT,
+                        updated_at                  DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )`, (createErr) => {
+                        if (createErr) { console.error('[migration] create popia_erasure_requests_new failed:', createErr.message); return db.run("ROLLBACK", () => db.run("PRAGMA foreign_keys=ON")); }
+                        db.run("INSERT INTO popia_erasure_requests_new SELECT * FROM popia_erasure_requests", (copyErr) => {
+                            if (copyErr) { console.error('[migration] copy popia_erasure_requests failed:', copyErr.message); return db.run("ROLLBACK", () => db.run("PRAGMA foreign_keys=ON")); }
+                            db.run("DROP TABLE popia_erasure_requests", (dropErr) => {
+                                if (dropErr) { console.error('[migration] drop popia_erasure_requests failed:', dropErr.message); return db.run("ROLLBACK", () => db.run("PRAGMA foreign_keys=ON")); }
+                                db.run("ALTER TABLE popia_erasure_requests_new RENAME TO popia_erasure_requests", (renameErr) => {
+                                    if (renameErr) { console.error('[migration] rename popia_erasure_requests_new failed:', renameErr.message); return db.run("ROLLBACK", () => db.run("PRAGMA foreign_keys=ON")); }
+                                    db.run(`CREATE INDEX IF NOT EXISTS idx_popia_requests_email ON popia_erasure_requests(email)`);
+                                    db.run(`CREATE INDEX IF NOT EXISTS idx_popia_requests_status ON popia_erasure_requests(status)`);
+                                    db.run(`CREATE INDEX IF NOT EXISTS idx_popia_requests_requested_at ON popia_erasure_requests(requested_at)`);
+                                    db.run("COMMIT", (commitErr) => {
+                                        db.run("PRAGMA foreign_keys=ON");
+                                        if (commitErr) { console.error('[migration] commit failed:', commitErr.message); return; }
+                                        console.log('[migration] popia_erasure_requests.status moved to trigger-based validation.');
+                                    });
+                                });
+                            });
+                        });
+                    });
+                });
+            });
+        });
+
+        db.run(`CREATE TRIGGER IF NOT EXISTS chk_popia_requests_status_insert
+        BEFORE INSERT ON popia_erasure_requests
+        WHEN NEW.status NOT IN ('pending','approved','rejected','processing','awaiting_refund','processed','failed')
+        BEGIN SELECT RAISE(ABORT, 'Invalid popia_erasure_requests.status value'); END`);
+
+        db.run(`CREATE TRIGGER IF NOT EXISTS chk_popia_requests_status_update
+        BEFORE UPDATE OF status ON popia_erasure_requests
+        WHEN NEW.status NOT IN ('pending','approved','rejected','processing','awaiting_refund','processed','failed')
+        BEGIN SELECT RAISE(ABORT, 'Invalid popia_erasure_requests.status value'); END`);
+
+        // POPIA erasure request email-ownership verification — same low-entropy-code shape as
+        // booking_access_codes, but keyed by email alone (no booking_id: there's no prior booking
+        // record to match against here, this proves mailbox ownership, not an existing account).
+        // No matching "session token" table — the raw code itself is re-verified (not re-consumed)
+        // across the preview call and the final submit call, which is the only place it's consumed.
+        db.run(`CREATE TABLE IF NOT EXISTS popia_verification_codes (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            email       TEXT NOT NULL,
+            code_hash   TEXT NOT NULL,
+            attempts    INTEGER NOT NULL DEFAULT 0,
+            consumed    INTEGER NOT NULL DEFAULT 0,
+            expires_at  DATETIME NOT NULL,
+            created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`, () => {
+            db.run(`CREATE INDEX IF NOT EXISTS idx_pvc_email ON popia_verification_codes(email, consumed)`);
+        });
+
+        // Registers the POPIA erasure OTP email as a manageable banner-registry citizen, same
+        // idempotent pattern as booking_verification_code above.
+        db.run(`INSERT OR IGNORE INTO email_template_banners (template_key, category) VALUES ('popia_verification_code', 'User Accounts & Security')`);
+
+        // Pre-event reminder (3 days before, all CONFIRMED bookings) — closes the "Event Reminders"
+        // banner category, which existed as a selectable category with no template ever mapped to it.
+        db.run("ALTER TABLE bookings ADD COLUMN event_reminder_sent_at DATETIME", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note:', err.message); });
+        db.run(`INSERT OR IGNORE INTO email_template_banners (template_key, category) VALUES ('event_reminder', 'Event Reminders')`);
+        // Client payment plans: the "Your Payment Plan Has Been Updated" confirmation the client gets
+        // after rearranging their milestones online (lib/booking-notifications.js
+        // sendPaymentPlanUpdatedEmail) — same idempotent registration as the keys above.
+        db.run(`INSERT OR IGNORE INTO email_template_banners (template_key, category) VALUES ('payment_plan_updated', 'Payments & Invoices')`);
+
+        // ============================================================
+        // Booking Recovery — abandoned booking drafts (abandoned-cart style)
+        // Captures partial booking-wizard progress so admins can recover lost
+        // opportunities. PII is minimised, auto-purged after 30 days (see
+        // runAbandonedBookingPurgeJob), and reminder emails are consent-gated.
+        // ============================================================
+        db.run(`CREATE TABLE IF NOT EXISTS abandoned_bookings (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            draft_token          TEXT UNIQUE NOT NULL,   -- client-generated id, stable across autosaves
+            resume_token         TEXT UNIQUE,            -- server-generated, used in resume/opt-out links
+            name                 TEXT,
+            company              TEXT,
+            email                TEXT,
+            cell                 TEXT,
+            event_name           TEXT,
+            event_date           TEXT,
+            event_start_time     TEXT,
+            performance_slot     TEXT,
+            performance_duration TEXT,
+            event_location       TEXT,
+            venue_address        TEXT,
+            city                 TEXT,
+            country              TEXT,
+            venue_type           TEXT,
+            event_type           TEXT,
+            message              TEXT,
+            services_json        TEXT,                   -- snapshot: [{service_id,name,quantity}]
+            current_step         INTEGER DEFAULT 1,
+            furthest_step        INTEGER DEFAULT 1,
+            consent_given        INTEGER DEFAULT 0,      -- ticked the Step-4 POPIA box? gates auto-email
+            status               TEXT DEFAULT 'ABANDONED', -- ABANDONED|REMINDED|RECOVERED|WON|LOST|CLOSED
+            reminders_sent       INTEGER DEFAULT 0,
+            last_reminder_at     DATETIME,
+            last_activity_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
+            created_at           DATETIME DEFAULT CURRENT_TIMESTAMP,
+            converted_booking_id INTEGER,
+            opt_out              INTEGER DEFAULT 0,
+            source               TEXT,                   -- data-bk-source (which CTA opened the modal)
+            ip_address           TEXT,
+            user_agent           TEXT,
+            est_value            REAL DEFAULT 0          -- estimated value of entered services (lost-revenue analytics)
+        )`, () => {
+            db.run(`CREATE INDEX IF NOT EXISTS idx_abandoned_status ON abandoned_bookings(status)`);
+            db.run(`CREATE INDEX IF NOT EXISTS idx_abandoned_activity ON abandoned_bookings(last_activity_at)`);
+            db.run(`CREATE INDEX IF NOT EXISTS idx_abandoned_resume ON abandoned_bookings(resume_token)`);
+            db.run(`CREATE INDEX IF NOT EXISTS idx_abandoned_email ON abandoned_bookings(email)`);
+        });
+
+        // ============================================================
+        // Public booking tracker — email-verification second factor.
+        // Knowing a booking id + the email on file used to be sufficient to view the full
+        // tracker (quote, payment status, contract, invoice) and to act on it (pay, accept,
+        // cancel, sign). booking_access_codes holds short-lived OTP codes sent to the email on
+        // file; booking_access_tokens holds the session issued once a code is verified, and is
+        // what every tracking route now requires instead of trusting a client-supplied email.
+        // ============================================================
+        db.run(`CREATE TABLE IF NOT EXISTS booking_access_codes (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            booking_id  INTEGER NOT NULL REFERENCES bookings(id),
+            email       TEXT NOT NULL,
+            code_hash   TEXT NOT NULL,      -- bcrypt hash of the 6-digit code (low-entropy secret)
+            attempts    INTEGER NOT NULL DEFAULT 0,
+            consumed    INTEGER NOT NULL DEFAULT 0,
+            expires_at  DATETIME NOT NULL,
+            created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`, () => {
+            db.run(`CREATE INDEX IF NOT EXISTS idx_bac_booking ON booking_access_codes(booking_id, consumed)`);
+        });
+
+        db.run(`CREATE TABLE IF NOT EXISTS booking_access_tokens (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            booking_id    INTEGER NOT NULL REFERENCES bookings(id),
+            email         TEXT NOT NULL,
+            token_hash    TEXT NOT NULL UNIQUE, -- sha256 of the raw token (high-entropy: fast hash, indexed lookup)
+            expires_at    DATETIME NOT NULL,
+            created_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
+            last_used_at  DATETIME
+        )`, () => {
+            db.run(`CREATE INDEX IF NOT EXISTS idx_bat_hash ON booking_access_tokens(token_hash)`);
+            db.run(`CREATE INDEX IF NOT EXISTS idx_bat_booking ON booking_access_tokens(booking_id)`);
+        });
+
+        // Ensure performance_end_time column exists on bookings (failsafe for older DBs)
+        db.run("ALTER TABLE bookings ADD COLUMN performance_end_time TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note: bookings.performance_end_time already exists or error: ' + err.message); });
+        db.run("ALTER TABLE bookings ADD COLUMN modified_on DATETIME", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note: bookings.modified_on already exists.'); });
+        // "Last Updated By" feature: bookings had modified_on but no actor column at all. modified_by_role
+        // is a snapshot of the admin's role AT THE TIME of the edit (not a live join to admins.role, which
+        // could drift if the admin's role changes later) — set by the route in the SAME UPDATE statement as
+        // modified_by, then read by the extended audit_bookings_update trigger below into audit_log.actor_role.
+        db.run("ALTER TABLE bookings ADD COLUMN modified_by INTEGER REFERENCES admins(id)", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note: bookings.modified_by already exists.'); });
+        db.run("ALTER TABLE bookings ADD COLUMN modified_by_role TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note: bookings.modified_by_role already exists.'); });
+        db.run("ALTER TABLE bookings ADD COLUMN buffer_minutes INTEGER DEFAULT NULL", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note: bookings.buffer_minutes migration:', err.message); });
+        db.run("ALTER TABLE bookings ADD COLUMN consent_source TEXT DEFAULT 'public_form'", (err) => { if (err && !err.message.includes('duplicate column name')) {} });
+        db.run("ALTER TABLE consent_audit ADD COLUMN consent_source TEXT DEFAULT 'public_form'", (err) => { if (err && !err.message.includes('duplicate column name')) {} });
+        // Phase 1 booking-lifecycle review (2026-09-29), P1-2: distinguishes the two distinct causes
+        // that both land on status='EXPIRED' — pending_inactivity (48h, no quote ever issued) vs
+        // quote_expiry (quoted, client never responded) — previously indistinguishable without
+        // manually diffing pending_at/quoted_at/quote_expiry_date. Set by expirePendingBooking /
+        // expireQuotedBooking (database/repositories/bookings.repository.js).
+        db.run("ALTER TABLE bookings ADD COLUMN expired_reason TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note: bookings.expired_reason migration:', err.message); });
+        // P1-1: stamped when a client files a quote-revision/extension request (routes/public/
+        // bookings.js's quote-revision-request route) so the automated quote-expiry sweep
+        // (lib/background-clerk.js) can extend past it instead of expiring a quote under active
+        // review. Cleared when a fresh quote is subsequently issued (routes/admin/bookings.js's
+        // quote route) — a new quote resets the negotiation.
+        db.run("ALTER TABLE bookings ADD COLUMN revision_requested_at DATETIME", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note: bookings.revision_requested_at migration:', err.message); });
+        // Client payment plans: stamped when the client rearranges their unpaid milestones online
+        // (POST /api/public/bookings/:id/payment-plan), shown in the admin Payment Milestones card as
+        // "Last changed by the client on …"; cleared when a re-acceptance builds a fresh plan. That
+        // route also sets modified_by = NULL, modified_by_role = 'client' (both added above) in the
+        // same UPDATE, so audit_bookings_update attributes the change to the client.
+        db.run("ALTER TABLE bookings ADD COLUMN payment_plan_changed_at DATETIME", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note: bookings.payment_plan_changed_at migration:', err.message); });
+
+        // ============================================================
+        // Legal & Compliance Centre — legal documents + version history
+        // ============================================================
+        // (Gate 2 = schema only) consent_audit already has policy_version + consent_source;
+        // add the two genuinely-missing columns. consent_type defaults to 'booking' (accurate for existing rows).
+        db.run("ALTER TABLE consent_audit ADD COLUMN consent_type TEXT DEFAULT 'booking'", (err) => { if (err && !err.message.includes('duplicate column name')) {} });
+        db.run("ALTER TABLE consent_audit ADD COLUMN source_email TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) {} });
+
+        db.run(`CREATE TABLE IF NOT EXISTS legal_documents (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            document_type       TEXT UNIQUE NOT NULL,
+            title               TEXT NOT NULL,
+            current_version_id  INTEGER,
+            status              TEXT DEFAULT 'draft' CHECK(status IN ('draft','published')),
+            last_published_at   DATETIME,
+            last_published_by   TEXT,
+            created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at          DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`, () => {
+            db.run(`INSERT OR IGNORE INTO legal_documents (document_type, title, status) VALUES
+                ('privacy_policy', 'Privacy Policy', 'published'),
+                ('terms_of_use',   'Terms of Use',   'published'),
+                ('cookie_policy',  'Cookie & Consent Policy', 'published')`);
+        });
+
+        db.run(`CREATE TABLE IF NOT EXISTS legal_document_versions (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            document_id     INTEGER NOT NULL,
+            version_number  TEXT NOT NULL,
+            content_html    TEXT NOT NULL,
+            change_summary  TEXT,
+            is_published    INTEGER DEFAULT 0,
+            published_at    DATETIME,
+            published_by    TEXT,
+            created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (document_id) REFERENCES legal_documents(id) ON DELETE CASCADE
+        )`, () => {
+            repairEncodedRichText('legal_document_versions', 'content_html');
+            // Seed the initial published version (1.0) once, from the existing static legal content.
+            db.get("SELECT COUNT(*) AS c FROM legal_document_versions", (err, row) => {
+                if (err || (row && row.c > 0)) return;
+                const seeds = {
+                    privacy_policy: `<h5>1. Introduction</h5>
+<p>Welcome to the official website of <strong>CulChar</strong>. We respect your privacy and are committed to protecting the personal information you share with us.</p>
+<h5>2. Information We Collect</h5>
+<ul>
+<li><strong>Contact &amp; booking forms:</strong> Name, email, phone, event details, and notes.</li>
+<li><strong>Newsletter subscriptions:</strong> Your email address.</li>
+<li><strong>Technical/usage data:</strong> IP address, browser type, and pages visited via server logs.</li>
+</ul>
+<p>We do <strong>not</strong> collect payment card details &mdash; payments are processed securely by PayFast.</p>
+<h5>3. How We Use Your Information</h5>
+<ul>
+<li>To respond to contact and booking requests.</li>
+<li>To send newsletters to opted-in subscribers.</li>
+<li>To generate booking quotes and email correspondence.</li>
+<li>To improve website performance and security.</li>
+<li>To comply with applicable legal obligations.</li>
+</ul>
+<h5>4. Cookies &amp; Local Storage</h5>
+<ul>
+<li><strong>Session cookies:</strong> Admin authentication sessions only.</li>
+<li><strong>Local storage:</strong> Cookie consent preference and personalisation settings.</li>
+<li><strong>Third-party embeds:</strong> YouTube, Instagram, TikTok, Facebook may set their own cookies.</li>
+</ul>
+<h5>5. Your Rights (POPIA)</h5>
+<p>Under South Africa&rsquo;s <strong>POPIA</strong>, you have the right to access, correct, or delete your data, and to unsubscribe from newsletters at any time. Contact: <a href="mailto:hello@culchar.example">hello@culchar.example</a></p>
+<h5>6. Data Security</h5>
+<p>We implement bcrypt password hashing, session-based authentication, rate limiting on public forms, and duplicate submission prevention.</p>
+<h5>7. Changes to This Policy</h5>
+<p>We may update this policy at any time. Continued use of the website after changes constitutes acceptance of the revised policy.</p>`,
+                    terms_of_use: `<h5>1. Introduction</h5>
+<p>These Terms &amp; Conditions govern your use of the official website of <strong>CulChar</strong>. By using this website, you agree to these Terms.</p>
+<h5>2. Use of the Website</h5>
+<ul>
+<li>Do not access unauthorised areas or attempt to bypass security.</li>
+<li>Do not use bots or scrapers to collect data without consent.</li>
+<li>Do not interfere with or damage servers or infrastructure.</li>
+<li>Do not impersonate others or use the site fraudulently.</li>
+</ul>
+<h5>3. Bookings &amp; Inquiries</h5>
+<p>Submitting a booking request does <strong>not</strong> constitute a confirmed booking. All bookings are subject to availability, management review, and a separate written agreement confirmed only upon written confirmation and receipt of any required deposit.</p>
+<h5>4. Intellectual Property</h5>
+<p>All content is the exclusive property of CulChar or licensed to him. You may not copy, reproduce, or use any content for commercial purposes without prior written consent.</p>
+<h5>5. Limitation of Liability</h5>
+<p>CulChar and his management shall not be liable for any direct, indirect, or consequential damages arising from use of this website. The site is provided &ldquo;as is&rdquo; without warranties of any kind.</p>
+<h5>6. Privacy</h5>
+<p>Use of this website is also governed by our Privacy Policy, incorporated into these Terms by reference.</p>
+<h5>7. Governing Law</h5>
+<p>These Terms are governed by the laws of the <strong>Republic of South Africa</strong>.</p>
+<h5>8. Contact</h5>
+<p><a href="mailto:hello@culchar.example">hello@culchar.example</a> &mdash; WhatsApp: <a href="https://wa.me/27821239876" target="_blank">+27 82 123 9876</a></p>`,
+                    cookie_policy: `<p>We use cookies to personalise content, analyse traffic, and enhance your experience on this site. Some are essential; others help us improve. Choose your preferences below &mdash; you can change them at any time via Cookie Settings in the footer.</p>`
+                };
+                Object.keys(seeds).forEach((type) => {
+                    db.get("SELECT id FROM legal_documents WHERE document_type = ?", [type], (e2, doc) => {
+                        if (e2 || !doc) return;
+                        db.run(`INSERT INTO legal_document_versions
+                            (document_id, version_number, content_html, change_summary, is_published, published_at, published_by)
+                            VALUES (?, '1.0', ?, 'Initial seeded version', 1, CURRENT_TIMESTAMP, 'system')`,
+                            [doc.id, seeds[type]], function () {
+                                const vid = this.lastID;
+                                db.run(`UPDATE legal_documents
+                                        SET current_version_id = ?, status = 'published',
+                                            last_published_at = CURRENT_TIMESTAMP, last_published_by = 'system'
+                                        WHERE id = ?`, [vid, doc.id]);
+                            });
+                    });
+                });
+            });
+        });
+        db.run(`CREATE INDEX IF NOT EXISTS idx_legal_versions_doc ON legal_document_versions(document_id)`);
+
+        db.run(`CREATE INDEX IF NOT EXISTS idx_working_hours_dow ON working_hours(day_of_week)`);
+
+        // ── Analytics Tables ──────────────────────────────────────────────────────────
+
+        // Individual page-view events (one row per visit to index.html)
+        db.run(`CREATE TABLE IF NOT EXISTS analytics_pageviews (
+            id              INTEGER  PRIMARY KEY AUTOINCREMENT,
+            session_id      TEXT     NOT NULL,
+            visitor_id      TEXT     NOT NULL,
+            page            TEXT     NOT NULL DEFAULT '/',
+            referrer        TEXT,
+            referrer_host   TEXT,
+            channel         TEXT,
+            utm_source      TEXT,
+            utm_medium      TEXT,
+            utm_campaign    TEXT,
+            country_code    TEXT,
+            country_name    TEXT,
+            device_type     TEXT,
+            browser         TEXT,
+            os              TEXT,
+            dwell_seconds   INTEGER  DEFAULT 0,
+            viewed_at       DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`, () => {
+            db.run(`CREATE INDEX IF NOT EXISTS idx_apv_session  ON analytics_pageviews(session_id)`);
+            db.run(`CREATE INDEX IF NOT EXISTS idx_apv_visitor  ON analytics_pageviews(visitor_id)`);
+            db.run(`CREATE INDEX IF NOT EXISTS idx_apv_date     ON analytics_pageviews(viewed_at)`);
+            db.run(`CREATE INDEX IF NOT EXISTS idx_apv_channel  ON analytics_pageviews(channel)`);
+        });
+
+        // One row per visitor session (30-minute inactivity window)
+        db.run(`CREATE TABLE IF NOT EXISTS analytics_sessions (
+            id                   INTEGER  PRIMARY KEY AUTOINCREMENT,
+            session_id           TEXT     NOT NULL UNIQUE,
+            visitor_id           TEXT     NOT NULL,
+            started_at           DATETIME DEFAULT CURRENT_TIMESTAMP,
+            ended_at             DATETIME,
+            entry_page           TEXT,
+            exit_page            TEXT,
+            page_count           INTEGER  DEFAULT 1,
+            total_dwell_seconds  INTEGER  DEFAULT 0,
+            is_bounce            INTEGER  DEFAULT 1,
+            country_code         TEXT,
+            country_name         TEXT,
+            device_type          TEXT,
+            browser              TEXT,
+            os                   TEXT,
+            channel              TEXT,
+            referrer_host        TEXT,
+            utm_source           TEXT,
+            utm_medium           TEXT,
+            utm_campaign         TEXT
+        )`, () => {
+            db.run(`CREATE INDEX IF NOT EXISTS idx_as_visitor ON analytics_sessions(visitor_id)`);
+            db.run(`CREATE INDEX IF NOT EXISTS idx_as_date    ON analytics_sessions(started_at)`);
+        });
+
+        // Daily pre-aggregated summary for fast dashboard queries
+        db.run(`CREATE TABLE IF NOT EXISTS analytics_daily (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            date             TEXT    NOT NULL UNIQUE,
+            pageviews        INTEGER DEFAULT 0,
+            unique_visitors  INTEGER DEFAULT 0,
+            sessions         INTEGER DEFAULT 0,
+            bounced_sessions INTEGER DEFAULT 0,
+            total_dwell_secs INTEGER DEFAULT 0
+        )`);
+
+        // Migration 117 (additive): what visitors look at and do on the one-page site (tracker.js, consenting visitors only) - a section
+        // seen ('section_view', once per visit) or something done ('interaction': an event opened, Get Tickets, the booking form opened /
+        // sent, ...). Events of a visit, never page views. Plus the visitor's city (geoip) for the Geography tab.
+        db.run(`CREATE TABLE IF NOT EXISTS analytics_events (
+            id          INTEGER  PRIMARY KEY AUTOINCREMENT,
+            session_id  TEXT     NOT NULL,
+            visitor_id  TEXT     NOT NULL,
+            event_type  TEXT     NOT NULL CHECK (event_type IN ('section_view', 'interaction')),
+            name        TEXT     NOT NULL,
+            detail      TEXT,
+            occurred_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`, () => {
+            db.run(`CREATE INDEX IF NOT EXISTS idx_aev_date ON analytics_events(occurred_at)`);
+            db.run(`CREATE INDEX IF NOT EXISTS idx_aev_type_name ON analytics_events(event_type, name)`);
+            db.run(`CREATE INDEX IF NOT EXISTS idx_aev_session ON analytics_events(session_id, event_type, name)`);
+        });
+        db.run("ALTER TABLE analytics_sessions ADD COLUMN city TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note: analytics_sessions.city: ' + err.message); });
+        db.run("ALTER TABLE analytics_pageviews ADD COLUMN city TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note: analytics_pageviews.city: ' + err.message); });
+        db.run("INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (117, 'analytics_events_and_city')");
+
+        // Migration 118 (additive): every answer to the cookie pop-up, anonymously (no visitor id, no cookie, no IP) - so the Dashboard can
+        // say how many visitors accepted or declined analytics, including the ones who are never tracked (index.html savePreferences).
+        db.run(`CREATE TABLE IF NOT EXISTS analytics_consent_choices (
+            id          INTEGER  PRIMARY KEY AUTOINCREMENT,
+            choice      TEXT     NOT NULL CHECK (choice IN ('accept_all', 'reject_all', 'custom')),
+            analytics   INTEGER  NOT NULL DEFAULT 0 CHECK (analytics IN (0, 1)),
+            functional  INTEGER  NOT NULL DEFAULT 0 CHECK (functional IN (0, 1)),
+            marketing   INTEGER  NOT NULL DEFAULT 0 CHECK (marketing IN (0, 1)),
+            is_change   INTEGER  NOT NULL DEFAULT 0 CHECK (is_change IN (0, 1)),
+            occurred_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`, () => {
+            db.run(`CREATE INDEX IF NOT EXISTS idx_acc_date ON analytics_consent_choices(occurred_at)`);
+        });
+        db.run("INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (118, 'analytics_consent_choices')");
+
+        // Admin login and activity logs table
+        db.run(`CREATE TABLE IF NOT EXISTS admin_login_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_id INTEGER NOT NULL,
+            login_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            logout_at DATETIME,
+            last_activity_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            duration_seconds INTEGER DEFAULT 0,
+            ip_address TEXT,
+            user_agent TEXT,
+            FOREIGN KEY (admin_id) REFERENCES admins(id) ON DELETE CASCADE
+        )`, () => {
+            db.run(`CREATE INDEX IF NOT EXISTS idx_admin_login_logs_admin ON admin_login_logs(admin_id)`);
+        });
+
+
+        // Status casing normalization migrations.
+        // NOTE (Phase 2 Gap 4): 'RESPONDED' was a legacy status name that has been retired.
+        // The migration below converts any stale RESPONDED/RESPOND rows back to PENDING on every
+        // startup. The status is no longer set by any code path in server.js.
+        db.run("UPDATE bookings SET status = 'PENDING' WHERE status IS NOT NULL AND UPPER(status) IN ('RESPONDED', 'RESPOND')");
+        db.run("UPDATE bookings SET status = UPPER(status) WHERE status IS NOT NULL");
+        db.run("UPDATE inquiries SET status = LOWER(status) WHERE status IS NOT NULL");
+        db.run("UPDATE quotations SET status = LOWER(status) WHERE status IS NOT NULL");
+        db.run("UPDATE invoices SET status = UPPER(status) WHERE status IS NOT NULL");
+        db.run("UPDATE contracts SET status = LOWER(status) WHERE status IS NOT NULL");
+        db.run("UPDATE payment_schedules SET status = LOWER(status) WHERE status IS NOT NULL");
+        db.run("UPDATE date_holds SET status = LOWER(status) WHERE status IS NOT NULL");
+        db.run("UPDATE transactions SET status = LOWER(status) WHERE status IS NOT NULL");
+
+        db.run("INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (100, 'abandoned_booking_recovery_system')");
+        db.run("INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (101, 'payment_schedules_sequence_and_source')");
+        db.run("INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (102, 'inquiry_messages_conversation_and_delivery')");
+        db.run("INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (103, 'inquiries_source_and_direct_emails_created_by')");
+        db.run("INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (104, 'inbox_sync_state')");
+        db.run("INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (105, 'calendar_m365_sync')");
+
+        // ── Manual EFT payments and proof-of-payment review (lib/eft.js, docs-internal/eft-payments.md) — migration 108 ──
+        // The banking details are VERSIONED, never edited in place: a change retires the active row and inserts a new one, so an invoice
+        // keeps pointing at the details it was issued with (invoices.bank_details_id). They live in their own table rather than `settings`
+        // because that table's generic API is readable by every admin role and is copied into process.env at boot.
+        db.run(`CREATE TABLE IF NOT EXISTS bank_details (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            version INTEGER NOT NULL,
+            account_holder TEXT NOT NULL,
+            bank_name TEXT NOT NULL,
+            account_number TEXT NOT NULL,
+            account_type TEXT NOT NULL,
+            branch_code TEXT NOT NULL,
+            swift_code TEXT,
+            reference_note TEXT,
+            payment_instructions TEXT,
+            is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)),
+            created_by INTEGER REFERENCES admins(id) ON DELETE SET NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            retired_at DATETIME,
+            retired_by INTEGER REFERENCES admins(id) ON DELETE SET NULL
+        )`);
+        db.run(`CREATE UNIQUE INDEX IF NOT EXISTS uq_bank_details_one_active ON bank_details(is_active) WHERE is_active = 1`);
+        // One row of switches, administrator-controlled, OFF until an administrator turns Manual EFT on.
+        db.run(`CREATE TABLE IF NOT EXISTS eft_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+            max_upload_mb INTEGER NOT NULL DEFAULT 5 CHECK (max_upload_mb BETWEEN 1 AND 15),
+            updated_by INTEGER REFERENCES admins(id) ON DELETE SET NULL,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`);
+        db.run(`INSERT OR IGNORE INTO eft_settings (id) VALUES (1)`);
+        // A client's proof of payment. Uploading one NEVER credits anything: the booking is credited only when an admin approves it, and
+        // that approval writes one transactions row (source 'manual', method 'bank_transfer') and links it back through transaction_id.
+        db.run(`CREATE TABLE IF NOT EXISTS eft_payment_submissions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            booking_id INTEGER NOT NULL REFERENCES bookings(id),
+            invoice_id INTEGER REFERENCES invoices(id),
+            schedule_id INTEGER,
+            claimed_amount DECIMAL(10,2) NOT NULL,
+            claimed_date DATE,
+            claimed_reference TEXT,
+            client_note TEXT,
+            proof_filename TEXT NOT NULL,
+            proof_original_name TEXT,
+            proof_mime TEXT NOT NULL,
+            proof_size INTEGER NOT NULL,
+            proof_sha256 TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected', 'replacement_requested')),
+            bank_details_id INTEGER REFERENCES bank_details(id),
+            submitted_by_email TEXT,
+            submitted_ip TEXT,
+            verified_amount DECIMAL(10,2),
+            verified_reference TEXT,
+            verified_date DATE,
+            review_note TEXT,
+            reviewed_by INTEGER REFERENCES admins(id) ON DELETE SET NULL,
+            reviewed_at DATETIME,
+            transaction_id INTEGER REFERENCES transactions(id),
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_eft_submissions_booking ON eft_payment_submissions(booking_id)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_eft_submissions_status ON eft_payment_submissions(status, created_at)`);
+        // A submission can become at most one ledger row, and a ledger row belongs to at most one submission - the database refuses a second.
+        db.run(`CREATE UNIQUE INDEX IF NOT EXISTS uq_eft_submissions_transaction ON eft_payment_submissions(transaction_id) WHERE transaction_id IS NOT NULL`);
+        db.run(`CREATE TABLE IF NOT EXISTS eft_submission_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            submission_id INTEGER NOT NULL REFERENCES eft_payment_submissions(id),
+            action TEXT NOT NULL,
+            actor_type TEXT NOT NULL CHECK (actor_type IN ('client', 'admin', 'system')),
+            actor_id INTEGER,
+            from_status TEXT,
+            to_status TEXT,
+            note TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_eft_events_submission ON eft_submission_events(submission_id)`);
+        // The banking details an invoice was issued with. NULL on every invoice issued before this migration (and while EFT is off).
+        db.run("ALTER TABLE invoices ADD COLUMN bank_details_id INTEGER REFERENCES bank_details(id)", (err) => { if (err && !err.message.includes('duplicate column name')) console.log('Note: invoices.bank_details_id: ' + err.message); });
+        db.run("INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (108, 'eft_manual_payments_and_proof_of_payment')");
+
+        // ── PayFast safety net (lib/payfast-reconcile.js, docs-internal/payfast.md) — migration 109 ──
+        // Finds payments PayFast says it received whose notification (ITN) never reached us, by asking PayFast's own transaction history, and records
+        // the ones that match a pending payment attempt exactly. One row of health for the admin screen (like inbox_sync_state)...
+        db.run(`CREATE TABLE IF NOT EXISTS payfast_reconcile_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            last_run_at DATETIME,
+            last_success_at DATETIME,
+            last_error TEXT,
+            last_error_category TEXT,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            retry_after DATETIME,
+            failure_alerted INTEGER NOT NULL DEFAULT 0,
+            last_stats TEXT,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )`);
+        db.run(`INSERT OR IGNORE INTO payfast_reconcile_state (id) VALUES (1)`);
+        // ...and one row per PayFast payment the safety net had something to say about. UNIQUE on PayFast's own payment id: a payment is reported
+        // once however many times the check runs. 'recovered' = recorded automatically; the others need a person.
+        db.run(`CREATE TABLE IF NOT EXISTS payfast_reconcile_findings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pf_payment_id TEXT NOT NULL UNIQUE,
+            m_payment_id TEXT,
+            booking_id INTEGER REFERENCES bookings(id),
+            kind TEXT NOT NULL CHECK (kind IN ('recovered', 'mismatch', 'duplicate_payment', 'blocked')),
+            gross_amount DECIMAL(10,2),
+            paid_at TEXT,
+            detail TEXT,
+            status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'resolved')),
+            transaction_id INTEGER,
+            first_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            notified_at DATETIME,
+            resolved_at DATETIME,
+            resolved_by INTEGER REFERENCES admins(id) ON DELETE SET NULL,
+            resolution_note TEXT
+        )`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_pf_findings_status ON payfast_reconcile_findings(status, first_seen_at)`);
+        db.run(`CREATE INDEX IF NOT EXISTS idx_pf_findings_booking ON payfast_reconcile_findings(booking_id)`);
+        db.run("INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (109, 'payfast_reconcile_safety_net')");
+
+        // Business profile (version 110): who issues our quotations and invoices + which SARS registrations apply (lib/business-profile-core.js).
+        // One row, seeded once with CIPC-public facts only; both registration switches start OFF. issuer_snapshot freezes what a document said about us.
+        {
+            const bp = require('./lib/business-profile-schema');
+            db.run(bp.CREATE_SQL);
+            const seed = bp.insertParams(bp.seedRow());
+            db.run(seed.sql, seed.params);
+            db.run("ALTER TABLE quotations ADD COLUMN issuer_snapshot TEXT", () => {});   // duplicate-column error on later boots is expected and ignored
+            db.run("ALTER TABLE invoices ADD COLUMN issuer_snapshot TEXT", () => {});
+            db.run("INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (?, ?)", [bp.MIGRATION_VERSION, bp.MIGRATION_NAME]);
+        }
+
+        // Client billing address (version 111): a full tax invoice over R5,000 needs the recipient's address (VAT Act s20) — captured the
+        // same way vat_number already is, as the booking's own column (what quotations/invoices read), editable by the client at
+        // accept-quote and by an administrator from the booking's Client card. lib/business-profile-core.js taxInvoiceAdvice() is the advisory.
+        db.run("ALTER TABLE bookings ADD COLUMN billing_address TEXT", (err) => { if (err && !err.message.includes('duplicate column name')) console.log("Note: billing_address already exists or error: " + err.message); });
+        db.run("INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (111, 'booking_billing_address')");
+
+        // Event ticketing (version 112): tiers, orders, tickets and PayFast notifications, all hanging off events(event_id).
+        // Additive only - see lib/ticketing-schema.js for the relationship rules and docs-internal/ticketing.md for the design.
+        require('./lib/ticketing-schema').apply(db);
+
+        // Notification centre + business activity log (version 119): admin_notifications, activity_log, per-admin reads/prefs, job heartbeats.
+        // Additive only - see lib/notifications-schema.js and docs-internal/notifications.md.
+        require('./lib/notifications-schema').apply(db);
+
+        // FAQ (version 121): questions and answers for the public FAQ section, managed in the admin. Starter drafts are seeded hidden, once.
+        require('./lib/faq-schema').apply(db);
+
+        // Homepage "What I do" cards follow the five rate-card categories (version 107): replaced only while still the shipped
+        // defaults, once. See lib/homepage-service-cards.js for the rules.
+        {
+            const homeCards = require('./lib/homepage-service-cards');
+            db.run(homeCards.UPDATE_SQL, homeCards.updateParams());
+            db.run(homeCards.MARKER_SQL);
+        }
+
+        // Official 2026 rate card — run-once data migration (version 106), after all schema/seed work above.
+        require('./lib/rate-card-2026').applyOnce(db);
+
+        console.log('Database tables initialized successfully.');
+    });
+}
+
+module.exports = db;

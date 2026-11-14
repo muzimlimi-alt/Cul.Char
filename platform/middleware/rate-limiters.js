@@ -1,0 +1,259 @@
+// Rate limiters — Phase 5 of the housekeeping effort (HOUSEKEEPING-NOTES.md). Moved out of the
+// server.js/app.js monolith byte-identical. Centralised here (rather than left inline in app.js)
+// specifically so route files extracted into routes/admin/ and routes/public/ have one place to
+// import whichever limiter their route used to be defined next to — app.js was the only place any
+// of these could be reached from before this file existed.
+let rateLimit;
+try { rateLimit = require('express-rate-limit'); } catch(e) { rateLimit = null; }
+
+// Rate limiter for public booking submissions (5 per 15 minutes per IP)
+const bookingRateLimiter = (rateLimit && process.env.NODE_ENV !== 'test') ? rateLimit({ windowMs: 15 * 60 * 1000, max: 5, standardHeaders: true, legacyHeaders: false, message: { success: false, message: 'Too many booking submissions from this device. Please wait 15 minutes and try again.' } }) : (req, res, next) => next();
+
+// Public Contact form (POST /send-email): its own budget, so a visitor's messages and a client's booking submissions do not use each other up.
+// Bypassed under NODE_ENV=test like its siblings; the per-address / duplicate rules in lib/contact-intake.js are DB-based and tested directly.
+const contactRateLimiter = (rateLimit && process.env.NODE_ENV !== 'test') ? rateLimit({ windowMs: 15 * 60 * 1000, max: 5, standardHeaders: true, legacyHeaders: false, message: { success: false, message: 'Too many messages from this device. Please wait 15 minutes and try again, or contact us directly.' } }) : (req, res, next) => next();
+
+// Limits exports/sitemaps to prevent resource exhaustion
+const exportRateLimiter = rateLimit ? rateLimit({
+    windowMs: 60 * 60 * 1000, // 1 hour
+    max: 15,
+    message: { success: false, message: 'Export limit reached. Please try again in an hour.' }
+}) : (req, res, next) => next();
+
+const sitemapRateLimiter = rateLimit ? rateLimit({
+    windowMs: 30 * 60 * 1000, // 30 mins
+    max: 20,
+    message: "Generating sitemaps too frequently. Please wait a while."
+}) : (req, res, next) => next();
+
+// Public booking tracking / document downloads: 10 per 15 minutes per address. Bypassed under NODE_ENV=test like its siblings above:
+// every test file shares one server and one address, and a full run makes more than 10 of these calls - the 11th got a 429 and crashed
+// service-visibility.test.js, skipping every file after it (test/rate-limiters.test.js checks production still enforces the limit).
+const trackRateLimiter = (rateLimit && process.env.NODE_ENV !== 'test') ? rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 mins
+    max: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { success: false, message: 'Too many tracking lookups from this device. Please wait 15 minutes and try again.' }
+}) : (req, res, next) => next();
+
+// Limiter for requesting a tracking verification code — guards against using it to email-bomb a
+// client's inbox, and against using response timing/shape to probe id/email combinations.
+const otpRequestRateLimiter = (rateLimit && process.env.NODE_ENV !== 'test') ? rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 mins
+    max: 5,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { success: false, message: 'Too many code requests. Please wait 15 minutes and try again.' }
+}) : (req, res, next) => next();
+
+// Strict limiter for state-mutating public endpoints (accept-quote, cancel) — email-only auth
+const mutateRateLimiter = (rateLimit && process.env.NODE_ENV !== 'test') ? rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 mins
+    max: 5,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { success: false, message: 'Too many attempts. Please wait 15 minutes and try again.' }
+}) : (req, res, next) => next();
+
+// Proof-of-payment uploads (POST /api/public/bookings/:id/eft/proof): files are the expensive thing to accept, so this has its own budget -
+// 10 per hour per address, apart from the 5-per-15-minutes mutate limiter that accepting a quote or paying uses up. A client who photographs
+// the wrong screen and uploads again must not be locked out for fifteen minutes. Bypassed under NODE_ENV=test like its siblings (the
+// per-booking caps in lib/eft.js are enforced in the database and tested there; test/rate-limiters.test.js checks this one in production mode).
+const popUploadRateLimiter = (rateLimit && process.env.NODE_ENV !== 'test') ? rateLimit({
+    windowMs: 60 * 60 * 1000, // 1 hour
+    max: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { success: false, message: 'Too many uploads from this device. Please wait an hour and try again, or email us your proof of payment.' }
+}) : (req, res, next) => next();
+
+// Event ticketing (routes/public/ticketing.js). Reserving tickets and starting a checkout: 40 per 10 minutes per address. A purchase uses two
+// (reserve + checkout), and at an on-sale many buyers share ONE address (mobile carriers' shared addresses, campus / office Wi-Fi), so 10 turned
+// the 6th buyer on a network away (load test, 2026-11-01). Hoarding stays bounded without it: one live hold per browser per show (hold_key),
+// max_per_order, and every hold expires after 10 minutes; bots are the Turnstile check's job.
+// Looking up an order / a ticket / the PDF: 120 per 10 minutes - the return page polls the order status every few seconds for up to two
+// minutes, and a /t/<token> lookup must not become a way to walk through tokens (144-bit, so it cannot be anyway). Both bypassed under
+// NODE_ENV=test like their siblings; test/rate-limiters.test.js checks production enforces them.
+const ticketReserveRateLimiter = (rateLimit && process.env.NODE_ENV !== 'test') ? rateLimit({
+    windowMs: 10 * 60 * 1000,
+    max: 40,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { success: false, message: 'Too many ticket requests from this device. Please wait 10 minutes and try again.' }
+}) : (req, res, next) => next();
+
+const ticketLookupRateLimiter = (rateLimit && process.env.NODE_ENV !== 'test') ? rateLimit({
+    windowMs: 10 * 60 * 1000,
+    max: 120,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { success: false, message: 'Too many requests from this device. Please wait a few minutes and try again.' }
+}) : (req, res, next) => next();
+
+// Door links (routes/public/ticketing-door.js): a busy door scans hundreds of tickets an hour, often from several phones on the venue's one
+// Wi-Fi address - so a generous 1200 per 10 minutes; the link itself (144-bit, per show, expiring) is the real protection.
+const doorRateLimiter = (rateLimit && process.env.NODE_ENV !== 'test') ? rateLimit({
+    windowMs: 10 * 60 * 1000,
+    max: 1200,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { success: false, message: 'Too many requests from this device. Please wait a minute and try again.' }
+}) : (req, res, next) => next();
+
+// Limiter for all authenticated admin routes (per IP) — bypassed in test mode, matching
+// bookingRateLimiter/mutateRateLimiter above: the integration suite runs many admin requests from
+// one IP across dozens of test files in the same 1-minute window, well beyond real admin usage.
+// 120 turned out too tight for real usage: a single dashboard load fires ~32 concurrent admin-gated
+// requests (loadDashboardKPIs + the dozen per-section loaders in the login-success handler), plus a
+// heartbeat every 60s — so 2-3 reloads/section switches within one minute already exceeded 120.
+const adminRateLimiter = (rateLimit && process.env.NODE_ENV !== 'test') ? rateLimit({
+    windowMs: 60 * 1000, // 1 minute
+    max: 400,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { success: false, message: 'Too many requests. Please slow down.' }
+}) : (req, res, next) => next();
+
+// P3-13: Tighter limiter for admin login — 5 attempts per 10 minutes per IP (brute-force protection)
+const adminLoginRateLimiter = rateLimit ? rateLimit({
+    windowMs: 10 * 60 * 1000, // 10 minutes
+    max: 5,
+    standardHeaders: true,
+    legacyHeaders: false,
+    skipSuccessfulRequests: true,
+    message: { success: false, message: 'Too many login attempts. Please wait 10 minutes before trying again.' },
+    // Notification Centre: a blocked address is one grouped alert per IP (lazy require: this file loads before most of the app)
+    handler: (req, res, next, options) => {
+        try { require('../lib/notify').emit('security.login_locked', { ip: req.ip || '', account: req.body && req.body.email ? String(req.body.email).slice(0, 120) : null }, { actorType: 'system', actorLabel: req.ip || null }); } catch (e) { /* never block the 429 */ }
+        res.status(options.statusCode).json(options.message);
+    }
+}) : (req, res, next) => next();
+
+// Tight limiter for the email-lookup endpoint — reduces enumeration risk
+const lookupRateLimiter = rateLimit ? rateLimit({
+    windowMs: 10 * 60 * 1000, // 10 minutes
+    max: 5,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { success: false, message: 'Too many lookup attempts. Please wait 10 minutes and try again.' }
+}) : (req, res, next) => next();
+
+// Generous limiter for the public analytics beacon — legit users send heartbeats
+const analyticsTrackLimiter = rateLimit ? rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 200,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { success: false, message: 'Analytics rate limit reached.' }
+}) : (req, res, next) => next();
+
+// --- Phase 6 (original numbering — a pre-existing in-app comment, not this housekeeping effort's
+// phases): Security & Rate Limiting ---
+const rateLimits = new Map();
+const RATE_LIMIT_WINDOW = 3600000; // 1 hour
+const MAX_REQUESTS = 100; // Increased for test suite automation
+
+const ipRateLimiter = (req, res, next) => {
+    // Every other hand-tuned limiter in this file (bookingRateLimiter, otpRequestRateLimiter,
+    // mutateRateLimiter, adminRateLimiter) already bypasses entirely under NODE_ENV=test — this one
+    // predates that convention and instead just had MAX_REQUESTS bumped to 100 "for test suite
+    // automation". That shared, IP-keyed budget is spent across every *.test.js file in one npm test
+    // run (they all share one server boot), so as the suite grows, legitimate requests in later files
+    // get 429'd and crash on the assumption they succeeded — not an actual abuse case to guard against
+    // in test env at all.
+    if (process.env.NODE_ENV === 'test') return next();
+    const ip = req.ip || req.connection.remoteAddress || 'unknown';
+    const now = Date.now();
+    const limit = rateLimits.get(ip) || { count: 0, resetTime: now + RATE_LIMIT_WINDOW };
+
+    if (now > limit.resetTime) {
+        limit.count = 1;
+        limit.resetTime = now + RATE_LIMIT_WINDOW;
+    } else {
+        limit.count++;
+    }
+
+    rateLimits.set(ip, limit);
+
+    if (limit.count > MAX_REQUESTS) {
+        return res.status(429).json({ success: false, message: 'Too many requests from this IP. Please try again in an hour.' });
+    }
+    next();
+};
+
+// PayFast valid IPs for ITN source validation.
+//
+// PayFast's own docs (developers.payfast.co.za/docs#step_4_confirm_payment) don't publish a
+// static IP list at all — their reference implementation resolves www.payfast.co.za,
+// sandbox.payfast.co.za, w1w.payfast.co.za and w2w.payfast.co.za live via DNS on every ITN and
+// checks against whatever comes back. Confirmed by live lookup (2026-10-15) that this matters:
+// www./sandbox. now resolve to GCP IPs (34.107.176.x / 34.120.184.x) via gcp-in.payfast.co.za,
+// and w1w./w2w. round-robin across a much larger, actively-changing pool that includes whole
+// ranges (102.216.36.x, 144.126.193.139, 13.245.74.88) absent from the 48-IP list this used to be
+// hardcoded to — a real production payment landing on any of those would have been silently
+// rejected here even though PayFast itself confirms the ITN is genuine.
+//
+// This keeps the original hardcoded list as a floor (never removed, so a transient DNS hiccup
+// can never make a previously-valid IP start failing) and layers a background-refreshed Set on
+// top, re-resolved every 15 minutes and merged in additively. Lookups never block a request —
+// the request-time check is a plain Set.has() against whatever has been resolved so far.
+const dns = require('dns');
+const PAYFAST_ITN_HOSTNAMES = ['www.payfast.co.za', 'sandbox.payfast.co.za', 'w1w.payfast.co.za', 'w2w.payfast.co.za'];
+const PAYFAST_VALID_IPS = new Set(process.env.PAYFAST_VALID_IPS
+    ? process.env.PAYFAST_VALID_IPS.split(',').map(ip => ip.trim())
+    : [
+        '197.97.145.144', '197.97.145.145', '197.97.145.146', '197.97.145.147',
+        '197.97.145.148', '197.97.145.149', '197.97.145.150', '197.97.145.151',
+        '197.97.145.152', '197.97.145.153', '197.97.145.154', '197.97.145.155',
+        '197.97.145.156', '197.97.145.157', '197.97.145.158', '197.97.145.159',
+        '41.74.179.192', '41.74.179.193', '41.74.179.194', '41.74.179.195',
+        '41.74.179.196', '41.74.179.197', '41.74.179.198', '41.74.179.199',
+        '41.74.179.200', '41.74.179.201', '41.74.179.202', '41.74.179.203',
+        '41.74.179.204', '41.74.179.205', '41.74.179.206', '41.74.179.207',
+        '41.74.179.208', '41.74.179.209', '41.74.179.210', '41.74.179.211',
+        '41.74.179.212', '41.74.179.213', '41.74.179.214', '41.74.179.215',
+        '41.74.179.216', '41.74.179.217', '41.74.179.218', '41.74.179.219',
+        '41.74.179.220', '41.74.179.221', '41.74.179.222', '41.74.179.223'
+    ]);
+
+function refreshPayfastValidIps() {
+    PAYFAST_ITN_HOSTNAMES.forEach(host => {
+        dns.resolve4(host, (err, addrs) => {
+            if (!err && addrs) addrs.forEach(ip => PAYFAST_VALID_IPS.add(ip));
+        });
+    });
+}
+refreshPayfastValidIps();
+if (process.env.NODE_ENV !== 'test') setInterval(refreshPayfastValidIps, 15 * 60 * 1000).unref();
+
+// S4-4: Rate limiter for PayFast ITN — generous window to allow retries, but caps floods.
+// Known PayFast IPs skip the limit entirely; unknown IPs (misconfigured proxies) are throttled.
+// Off under NODE_ENV=test like its siblings: the whole suite posts synthetic notifications from one address, and over 20 a minute the
+// limiter refuses (see the handler) - payments in later test files then never arrive (found 2026-11-01).
+const payfastItnRateLimiter = (rateLimit && process.env.NODE_ENV !== 'test') ? rateLimit({
+    windowMs: 60 * 1000, // 1-minute window
+    max: 20,             // 20 ITNs/min is more than enough for all PayFast retry patterns
+    standardHeaders: true,
+    legacyHeaders: false,
+    skip: (req) => {
+        const ip = (req.ip || '').replace('::ffff:', '');
+        return PAYFAST_VALID_IPS.has(ip);
+    },
+    handler: (req, res) => {
+        // 503 "busy", NOT 200 (owner's call, 2026-11-01): a 200 tells PayFast the notification was handled, so it never sends it again and a
+        // genuine payment that happened to be throttled would be lost until the safety net found it. A 503 makes PayFast retry it later.
+        // PayFast's own addresses skip this limit, so in practice only a misread address (proxy settings) ever gets here.
+        console.warn(`[PayFast ITN] Rate limit hit from IP: ${req.ip} - answering 503 so PayFast retries`);
+        res.set('Retry-After', '60');
+        res.sendStatus(503);
+    }
+}) : (req, res, next) => next();
+
+module.exports = {
+    bookingRateLimiter, contactRateLimiter, exportRateLimiter, sitemapRateLimiter, trackRateLimiter,
+    otpRequestRateLimiter, mutateRateLimiter, adminRateLimiter, adminLoginRateLimiter,
+    lookupRateLimiter, analyticsTrackLimiter, ipRateLimiter, popUploadRateLimiter,
+    ticketReserveRateLimiter, ticketLookupRateLimiter, doorRateLimiter,
+    PAYFAST_VALID_IPS, payfastItnRateLimiter,
+};

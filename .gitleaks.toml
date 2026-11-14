@@ -1,0 +1,6 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Public PayFast sandbox test credentials used by the test suite"
+regexes = ['''46f0cd694581a''']

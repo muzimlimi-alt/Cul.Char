@@ -1,0 +1,54 @@
+{
+  "name": "culchar-platform",
+  "version": "1.0.0",
+  "description": "CulChar business platform: public quote builder, admin portal and client tracker",
+  "main": "index.js",
+  "scripts": {
+    "start": "node server.js",
+    "stop": "taskkill /im node.exe /F",
+    "backup": "node scripts/backup.js",
+    "test": "node test/run.js",
+    "smoke": "node test/smoke.js",
+    "test:browser": "node test/browser/run-all.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1146.0",
+    "bcrypt": "^6.0.0",
+    "connect-sqlite3": "^0.9.16",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.4.1",
+    "express-session": "^1.19.0",
+    "geoip-lite": "^2.0.2",
+    "googleapis": "^190.0.0",
+    "helmet": "^8.1.0",
+    "ical-generator": "^10.2.0",
+    "image-size": "^2.0.2",
+    "moment-timezone": "^0.6.1",
+    "multer": "^2.0.2",
+    "node-schedule": "^2.1.1",
+    "nodemailer": "^10.5.0",
+    "pdfkit": "^0.18.0",
+    "qrcode": "^1.5.4",
+    "sharp": "^0.35.5",
+    "sqlite3": "^6.0.1",
+    "ua-parser-js": "^2.0.10"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14",
+    "puppeteer": "^25.17.0"
+  },
+  "overrides": {
+    "connect-sqlite3": {
+      "sqlite3": "$sqlite3"
+    }
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

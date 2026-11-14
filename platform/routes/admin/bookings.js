@@ -1,0 +1,3271 @@
+const express = require('express');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const multer = require('multer');
+const moment = require('moment-timezone');
+const db = require('../../database');
+const { requireAdmin } = require('../../middleware/auth');
+const { requireRole } = require('../../middleware/rbac');
+const { mutateRateLimiter } = require('../../middleware/rate-limiters');
+const { resolveDocsPath, docsWriteDir, PROJECT_ROOT, DOCS_PATH } = require('../../lib/runtime-paths');
+const objectStorage = require('../../lib/object-storage');
+const { sanitizeAboutHtml } = require('../../lib/html-sanitize');
+// Phase 5 housekeeping fix: dbGet was called at 5 sites below (all in the contract cluster moved in
+// sub-batch C) with no import anywhere in this file — a missing re-import from that move, not a
+// pre-existing app bug (app.js itself has always imported these from lib/db-helpers). Restores the
+// original working behaviour; no logic changed.
+const { dbRun, dbGet, dbAll } = require('../../lib/db-helpers');
+// Phase 5: MUST stay the exact same singleton module.exports app.js and every other route file
+// import — see lib/db-transaction.js's own header comment.
+const { withDbTransaction } = require('../../lib/db-transaction');
+const { calculateCancellationRefund } = require('../../lib/cancellation-refund');
+const { escapeEmailFields } = require('../../lib/email-escape');
+const { getEmailFooterContext } = require('../../lib/email-context');
+const { findOrCreateClient, findOrCreateVenueFromPlace } = require('../../lib/client-venue');
+const { resolveLineTaxClasses, getVatRate, computeDocumentTotals } = require('../../lib/document-totals');
+const businessProfile = require('../../lib/business-profile');
+const { normaliseClientVat, CLIENT_VAT_MESSAGE, PATTERNS } = require('../../lib/business-profile-core');
+const { asBookingText } = require('../../lib/booking-tracking');
+const {
+    DEFAULT_CONTRACT_CLAUSES, CONTRACT_ELIGIBLE_STATUSES,
+    resolveContractFeeData, assembleContractHtml, generateContract
+} = require('../../lib/contracts');
+const {
+    sendQuoteEmail, sendBookingConfirmedEmail, sendReviewRequestEmail, remindBooking, sendDateChangedEmail,
+    sendAdminQuoteSentNotification, sendBookingCompletedEmail, sendRefundProcessedEmail, sendAdminCompletionSummaryEmail
+} = require('../../lib/booking-notifications');
+const {
+    hasCalendarConflict, syncBookingToCalendar, checkDateAvailability, isWithinWorkingHours
+} = require('../../lib/calendar-sync');
+const { addMinutesToTime, parseDurationToMinutes } = require('../../lib/time-utils');
+const { deleteGoogleEvent } = require('../../lib/google-calendar');
+const { sendCancellationEmail } = require('../../lib/booking-cancellation-email');
+const { CURRENT_POLICY_VERSION } = require('../../lib/booking-policy');
+const { catalogueUnitPrice, checkQuoteLinePricing, needsIndividualQuote, describePrice } = require('../../lib/service-pricing');
+const { withStoredDescriptions } = require('../../lib/booking-lines');
+const { agreedAmountSql, receivedAmountSql, revenueRowsSql } = require('../../lib/booking-amounts');
+const { getQuotationConditions } = require('../../lib/pricing-conditions');
+const {
+    processManualPayment, alignMilestonePayments, deriveBookingStatusAfterPayment, deriveManualPaymentStatus, updateBookingMilestones
+} = require('../../lib/payment-processing');
+const { applyStatusChange } = require('../../lib/booking-status');
+const { rescheduleBooking } = require('../../lib/booking-reschedule');
+const { generateInvoice } = require('../../lib/invoicing');
+const bannerRegistry = require('../../js/bannerRegistry');
+const emailComponents = require('../../js/emailComponents');
+const { sendEmail } = require('../../js/emailService');
+const { getSenderEmail } = require('../../lib/smtp-config');
+const pdfService = require('../../js/pdfService');
+const {
+    getBookingNotesForBooking, insertBookingNote, getBookingNoteById, deleteBookingNote,
+    unlinkBookingClient, getBookingStatusNameEmail, reopenBooking, getBookingStatus, getBookingForContractRemind,
+    stampReviewEmailSent, getBookingById, getBookingByIdAsync, insertBookAgainBooking, getBookingEventId,
+    updateBookingVenueUnlink, updateBookingVenueLinkLegacy, updateBookingVenueGoogle, updateBookingVenueFreeText,
+    updateBookingDateAndTimeFields, setBookingClientId, updateBookingAfterQuote, deleteBookingLineItems,
+    deleteBookingServices, insertBookingLineItem, insertBookingService,
+    cancelBookingAsync, clearBookingPublicAndEventIdAsync, clearBookingGoogleEventId, markBookingCompletedManual,
+    setBookingPaymentStatus, getActiveDuplicateBookingForEmailDate, getActiveDuplicateBookingForEmailDateAsync,
+    insertAdminBooking, updateBookingBuffer, setBookingPublicWithNewEvent, setBookingPublicTicketLink,
+    clearBookingPublicWithEvent, clearBookingPublicTicketLink, getBookingDisposition, updateBookingDisposition,
+    updateBookingLedgerFromReconcile, getBookingTotalAmount, deleteBookingById, markBookingPendingAfterRespond
+} = require('../../database/repositories/bookings.repository');
+const {
+    getQuoteHistoryForBooking, getQuoteForBookingFinancials, getInvoiceForBookingFinancials,
+    getInvoiceFileForAdminDownload, getQuoteFileForAdminDownload, getQuoteFileForAdminDownloadById, getLatestQuoteFileForResend, markQuotationResent,
+    getQuoteNumberCollisionCount, voidInvoiceForRequote, archivePreviousQuotations, getNextQuoteVersion,
+    insertQuotation, insertQuoteLineItem,
+    voidInvoicesForCancelledBookingAsync, getActiveQuoteStatusForInvoiceGuard, markInvoicePaidIfOpen,
+    markInvoicePaidOnStatusComplete
+} = require('../../database/repositories/invoices-quotations.repository');
+const {
+    getExpensesForBooking, getCancellationDetailForBooking, getTransactionsForBooking,
+    supersedePaymentSchedulesForRequote,
+    getRecentPayfastTransactionForBooking, insertCancellationForAdminCancel, cancelPendingPaymentSchedulesAsync,
+    getCancellationForRefund, getAlreadyRefundedAmount, updateCancellationRefund, insertRefundTransaction,
+    getTransactionsPaidSumForReconcile, getActivePaymentSchedules, supersedeLivePaymentSchedules,
+    insertAdminPaymentScheduleRow, prepareUpdatePaymentScheduleAmount
+} = require('../../database/repositories/finance.repository');
+const {
+    unlinkEventVenue, updateEventVenueLegacyLink, updateEventVenueGoogleLink, updateEventVenueFreeText,
+    updateDateHoldDateForBooking, updateEventDatetime,
+    releaseDateHoldsForBookingAsync, getEventByBookingId, demoteEventForCancelledBookingByBookingIdAsync,
+    clearEventGoogleCalendarIdAsync, advanceEventToCompleted, insertPublicEvent, checkEventExistsById,
+    updatePublicEvent, deleteEventById
+} = require('../../database/repositories/calendar.repository');
+const { linkInquiryToBooking } = require('../../database/repositories/inquiries.repository');
+const router = express.Router();
+
+// Quote state for the admin booking list / detail queries (rate card 2026, Phase 5).
+// `bookings.quote_amount` holds the catalogue ESTIMATE ('R 5000.00', or 'R 0.00' when the services
+// are individually priced) until a quotation is issued, so its truthiness is NOT a "quote issued"
+// signal. These two columns are:
+//   has_quote       1 when a quotation row stands for the booking, or the booking was ever stamped quoted_at
+//   unpriced_lines  lines whose service needs an individual quote and still carries no agreed amount
+// Needs the `b` (bookings) and `lq` (latest quotation) aliases in the host query. Ends with a comma.
+const QUOTE_STATE_SQL = `CASE WHEN lq.id IS NOT NULL OR b.quoted_at IS NOT NULL THEN 1 ELSE 0 END AS has_quote,
+        (SELECT COUNT(*) FROM booking_services bsu
+           JOIN services su ON su.id = bsu.service_id
+          WHERE bsu.booking_id = b.id
+            AND COALESCE(su.price_type, 'fixed') != 'fixed'
+            AND COALESCE(bsu.unit_price, 0) <= 0) AS unpriced_lines,`;
+
+// PUT /api/admin/bookings/:id/disposition — booking triage (soft-decline). Deliberately NOT
+// routed through applyStatusChange/ALLOWED_TRANSITIONS: disposition is an orthogonal axis (same
+// pattern as payment_status alongside status) so declining a bad-fit lead as "not a fit" or
+// shelving it as "archived" doesn't touch the pipeline state machine and doesn't read as a
+// cancelled deal in the audit trail or conversion analytics.
+const BOOKING_DISPOSITIONS = ['active', 'not_a_fit', 'archived'];
+
+// Rows removed with the booking. `PRAGMA foreign_keys = ON` is set on the shared connection, and
+// every one of these declares a FK to bookings(id) with ON DELETE NO ACTION — so any table missing
+// from this list makes `DELETE FROM bookings` fail outright with FOREIGN KEY constraint failed.
+// consent_audit, payment_logs and reminders_log were missing, which made 15 of the 33 bookings
+// that business rules allow deleting undeletable (HTTP 500).
+//
+// consent_audit is purged deliberately: deleting a booking erases the personal data captured with
+// it (IP, user agent), so retaining its consent proof would leave exactly the orphaned rows this
+// route produced before FK enforcement. The audit_log DELETE entry remains as the record.
+//
+// Order matters — node-sqlite3 runs these sequentially on the one connection, so line-item children
+// go before their parent invoice/quotation rows, and bookings.event_id is cleared before the events
+// row it points at is removed (bookings.event_id and events.booking_id reference each other).
+const BOOKING_DELETE_PURGE = [
+    "UPDATE bookings SET event_id = NULL WHERE id = ?",
+    // Manual EFT proofs (lib/eft.js) point at the booking's invoices and transactions, so they go first. A booking with money on it cannot be
+    // deleted at all (the route refuses), so an approved proof never reaches here - only unreviewed / rejected ones. Their files are removed
+    // after the commit.
+    "DELETE FROM eft_submission_events WHERE submission_id IN (SELECT id FROM eft_payment_submissions WHERE booking_id = ?)",
+    "DELETE FROM eft_payment_submissions WHERE booking_id = ?",
+    // PayFast safety net findings reference the booking (and a transaction); a booking with money on it cannot be deleted, so these are only ever the open
+    // "needs a person" notes of an unpaid one.
+    "DELETE FROM payfast_reconcile_findings WHERE booking_id = ?",
+    "DELETE FROM invoice_line_items WHERE invoice_id IN (SELECT id FROM invoices WHERE booking_id = ?)",
+    "DELETE FROM quote_line_items WHERE quotation_id IN (SELECT id FROM quotations WHERE booking_id = ?)",
+    "DELETE FROM quotations WHERE booking_id = ?",
+    "DELETE FROM invoices WHERE booking_id = ?",
+    "DELETE FROM cancellations WHERE booking_id = ?",
+    "DELETE FROM contracts WHERE booking_id = ?",
+    "DELETE FROM payment_schedules WHERE booking_id = ?",
+    "DELETE FROM booking_services WHERE booking_id = ?",
+    "DELETE FROM booking_line_items WHERE booking_id = ?",
+    "DELETE FROM service_reviews WHERE booking_id = ?",
+    "DELETE FROM booking_notes WHERE booking_id = ?",
+    "DELETE FROM communication_log WHERE booking_id = ?",
+    "DELETE FROM transactions WHERE booking_id = ?",
+    "DELETE FROM date_holds WHERE converted_to_booking_id = ?",
+    "DELETE FROM events WHERE booking_id = ?",
+    "DELETE FROM consent_audit WHERE booking_id = ?",
+    "DELETE FROM payment_logs WHERE booking_id = ?",
+    "DELETE FROM reminders_log WHERE booking_id = ?",
+    // Added after an end-to-end booking-flow audit found these missing — any booking a client had
+    // tracked, or that had an Advancing Pack started, was undeletable (FK constraint failure).
+    "DELETE FROM booking_access_codes WHERE booking_id = ?",
+    "DELETE FROM booking_access_tokens WHERE booking_id = ?",
+    // run_of_show_items / advancing_contacts cascade automatically via their own ON DELETE CASCADE
+    // from advancing_packs(id) — only the parent row needs an explicit purge here.
+    "DELETE FROM advancing_packs WHERE booking_id = ?"
+];
+
+// Records that outlive the booking. An expense is a cost the business incurred and a bank statement
+// line is a bank's record — neither stops existing because a booking was removed. Both columns are
+// nullable, so the row is kept and only the link is dropped.
+const BOOKING_DELETE_UNLINK = [
+    "UPDATE expenses SET booking_id = NULL WHERE booking_id = ?",
+    "UPDATE bank_statement_lines SET matched_booking_id = NULL WHERE matched_booking_id = ?"
+];
+
+// P2.6 — Contract management (admin)
+const contractUpload = multer({
+    storage: objectStorage.multerStorage({
+        destination: function(req, file, cb) {
+            cb(null, docsWriteDir('contracts'));
+        },
+        filename: function(req, file, cb) {
+            cb(null, `contract-${req.params.id}-${Date.now()}${path.extname(file.originalname)}`);
+        }
+    }),
+    fileFilter: function(req, file, cb) {
+        if (file.mimetype === 'application/pdf') {
+            cb(null, true);
+        } else {
+            cb(new Error('Only PDF files are accepted for contract uploads.'), false);
+        }
+    },
+    limits: { fileSize: 10 * 1024 * 1024 }
+});
+
+// Proof of payment (manual/EFT payment recording) — a bank app screenshot/photo is at least as
+// common as a PDF statement here, unlike the contract upload above.
+const PAYMENT_PROOF_MIMES = ['application/pdf', 'image/jpeg', 'image/png', 'image/webp'];
+const paymentProofUpload = multer({
+    storage: objectStorage.multerStorage({
+        destination: function(req, file, cb) {
+            cb(null, docsWriteDir('payment_proofs'));
+        },
+        filename: function(req, file, cb) {
+            cb(null, `payment-proof-${req.params.id}-${Date.now()}${path.extname(file.originalname)}`);
+        }
+    }),
+    fileFilter: function(req, file, cb) {
+        if (PAYMENT_PROOF_MIMES.includes(file.mimetype)) {
+            cb(null, true);
+        } else {
+            cb(new Error('Only PDF, JPEG, PNG, or WEBP files are accepted as proof of payment.'), false);
+        }
+    },
+    limits: { fileSize: 10 * 1024 * 1024 }
+});
+
+// Emails the generated contract PDF to the client with a link to the tracking page, where they can
+// review and sign it online. Mirrors sendInvoicePreDueEmail's structure.
+async function sendContractEmail(booking, contractPdfPath) {
+    booking = escapeEmailFields(booking);
+    const { id, name, email, event_name, event_type, date } = booking;
+    const baseUrl = process.env.BASE_URL || 'https://www.culchar.example';
+    const signUrl = `${baseUrl}/?track=${id}&email=${encodeURIComponent(email)}`;
+
+    const attachments = [];
+    if (contractPdfPath && await objectStorage.fileExists(contractPdfPath)) {
+        attachments.push({ filename: `Contract_${id}_CulChar_CulChar.pdf`, content: await objectStorage.readFile(contractPdfPath), contentType: 'application/pdf' });
+    }
+
+    const { socialLinks } = await getEmailFooterContext();
+    const banner = await bannerRegistry.resolveBanner('contract_sent');
+    const htmlContent = emailComponents.renderPremiumEmail({
+        preheaderText: `Your booking contract for #${id} is ready to review and sign.`,
+        bannerSrc: banner?.src, bannerAlt: banner?.alt, subtitle: banner?.subtitle,
+        headline: banner?.headline || 'Your Booking Contract',
+        greeting: `Hi ${name},`,
+        bodyHtml:
+            `Your booking contract for <strong style="color:#FAFAFA;">${event_name || event_type}</strong> on <strong style="color:#FAFAFA;">${date}</strong> is ready. Please review the attached PDF and sign it online at your convenience.` +
+            `<p style="margin:10px 0 0; color:#B0B0B0; font-size:12px;">Once you've signed, our team will countersign to finalise the agreement. If you have any questions about the terms, just reply to this email. (Booking reference #${id})</p>`,
+        cta: { label: 'Review & Sign Contract', url: signUrl },
+        socialLinks
+    });
+
+    const result = await sendEmail({
+        to: email,
+        subject: `Your booking contract: ${event_name || event_type} (Booking #${id})`,
+        htmlContent,
+        preWrapped: true,
+        attachments,
+        titleOverride: 'Your Booking Contract',
+        trigger_event: 'Booking: Contract Sent'
+    });
+    return result.success;
+}
+
+// Gap 10: GET — fetch outgoing communication log for a booking
+router.get('/api/admin/bookings/:id/communications', requireAdmin, (req, res) => {
+    db.all(
+        `SELECT id, direction, channel, subject, content_snippet, sent_at, created_at
+         FROM communication_log WHERE booking_id = ? ORDER BY created_at DESC LIMIT 50`,
+        [req.params.id],
+        (err, rows) => res.json({ success: !err, logs: rows || [] })
+    );
+});
+
+// Unlink a booking from its client record so COALESCE falls back to the booking's own name/email.
+// Use when client_id was incorrectly assigned (e.g. email collision in findOrCreateClient).
+router.post('/api/admin/bookings/:id/unlink-client', requireAdmin, (req, res) => {
+    unlinkBookingClient(req.params.id, function(err) {
+        if (err) return res.status(500).json({ success: false, error: err.message });
+        if (this.changes === 0) return res.status(404).json({ success: false, message: 'Booking not found.' });
+        res.json({ success: true, message: `client_id cleared for booking #${req.params.id}` });
+    });
+});
+
+// S5-4: Threaded booking notes — replaces the single admin_notes text blob.
+router.get('/api/admin/bookings/:id/notes', requireAdmin, (req, res) => {
+    getBookingNotesForBooking(
+        req.params.id,
+        (err, rows) => {
+            if (err) return res.status(500).json({ success: false, error: err.message });
+            res.json({ success: true, notes: rows || [] });
+        }
+    );
+});
+
+router.post('/api/admin/bookings/:id/notes', requireAdmin, (req, res) => {
+    const { note, author } = req.body;
+    if (!note || !note.trim()) return res.status(400).json({ success: false, message: 'Note text is required.' });
+    insertBookingNote(
+        req.params.id, note.trim(), (author || 'Admin').trim(),
+        function(err) {
+            if (err) return res.status(500).json({ success: false, error: err.message });
+            getBookingNoteById(this.lastID, (e, row) => {
+                res.json({ success: true, note: row });
+            });
+        }
+    );
+});
+
+router.delete('/api/admin/bookings/:id/notes/:noteId', requireAdmin, (req, res) => {
+    deleteBookingNote(
+        req.params.noteId, req.params.id,
+        function(err) {
+            if (err) return res.status(500).json({ success: false, error: err.message });
+            if (this.changes === 0) return res.status(404).json({ success: false, message: 'Note not found.' });
+            res.json({ success: true });
+        }
+    );
+});
+
+// --- Booking Line Items + Transactions (lazy detail) ---
+router.get('/api/admin/bookings/:id/details', requireAdmin, (req, res) => {
+    const id = req.params.id;
+    // Prefer booking_services if available, fallback to booking_line_items for legacy data
+    db.all(`SELECT bs.*, bs.quantity_minutes as quantity, s.name as service_name, s.display_unit,
+                   s.pricing_model, s.default_price, s.base_price, s.price_type, s.price_min, s.price_max, s.price_unit
+            FROM booking_services bs
+            LEFT JOIN services s ON bs.service_id = s.id
+            WHERE bs.booking_id = ?
+            ORDER BY bs.id`, [id], (e1, servicesRaw) => {
+      // `service_name` above is the service's name TODAY; line_description is what the line was called when it was booked / quoted (a
+      // rate-card update renamed three re-used services, so a historical booking must not read as a different offering - lib/booking-lines.js).
+      db.all('SELECT service_id, description FROM booking_line_items WHERE booking_id = ? ORDER BY id', [id], (eL, storedLines) => {
+        const servicesItems = servicesRaw ? withStoredDescriptions(servicesRaw, eL ? [] : storedLines) : servicesRaw;
+
+        getCancellationDetailForBooking(id, (e3, cancellation) => {
+            const sendResponse = (items, txs) => {
+                res.json({
+                    line_items: items || [],
+                    transactions: txs || [],
+                    cancellation: cancellation || null
+                });
+            };
+
+            if (servicesItems && servicesItems.length > 0) {
+                // A line whose service is priced individually and carries no agreed amount yet is "to be quoted",
+                // not a R0 fee — the Deal View says so instead of printing R0.00 (rate card 2026).
+                const priced = servicesItems.map(it => ({
+                    ...it,
+                    ...describePrice(it),
+                    unpriced: needsIndividualQuote(it) && !(parseFloat(it.unit_price) > 0)
+                }));
+                getTransactionsForBooking(id, (e2, transactions) => {
+                    sendResponse(priced, transactions);
+                });
+            } else {
+                // Legacy fallback
+                db.all("SELECT bli.*, s.name as service_name FROM booking_line_items bli LEFT JOIN services s ON bli.service_id = s.id WHERE bli.booking_id = ?", [id], (e1, lineItems) => {
+                    getTransactionsForBooking(id, (e2, transactions) => {
+                        sendResponse(lineItems, transactions);
+                    });
+                });
+            }
+        });
+      });
+    });
+});
+
+router.get('/api/admin/bookings/:id/quote-history', requireAdmin, (req, res) => {
+    getQuoteHistoryForBooking(
+        req.params.id, (err, rows) => {
+            if (err) return res.status(500).json({ error: err.message });
+            // pdf_url must be a URL that OPENS: the stored files are behind the blocked /docs/ path, so link to the authenticated
+            // per-version download (the Files tab chip and the history list both use this field as their href).
+            res.json((rows || []).map(r => ({
+                ...r,
+                pdf_url: r.file_path ? `/api/admin/bookings/${req.params.id}/quote/${r.id}/download` : null
+            })));
+        }
+    );
+});
+
+// GET /api/admin/bookings/:id/expenses — expenses for a specific booking + P&L
+router.get('/api/admin/bookings/:id/expenses', requireAdmin, requireRole(['administrator', 'manager']), (req, res) => {
+    const bookingId = req.params.id;
+    getExpensesForBooking(bookingId, (err, expenses) => {
+        if (err) return res.status(500).json({ success: false, message: err.message });
+        const totalExpenses = (expenses || []).reduce((sum, e) => sum + parseFloat(e.amount || 0), 0);
+        // The booking's revenue for P&L is its AGREED amount: the quotation that currently stands (a revision archives the one before it),
+        // else the amount on the booking itself for one entered straight at CONFIRMED. Until a quotation exists bookings.total_amount holds
+        // only the catalogue ESTIMATE (lib/booking-amounts.js) - a published rate, not revenue - so an unquoted enquiry reads R0.00.
+        // This used to select `q.total`, a column that does not exist; the error was swallowed and every booking read R0.00.
+        // Money that went back OUT - refunds and chargebacks (completed, not flagged as duplicates) - comes off the net: a refund leaves the account.
+        db.get(
+            `SELECT CASE WHEN ${agreedAmountSql('b')} THEN COALESCE(
+                        (SELECT q.total_amount FROM quotations q
+                          WHERE q.booking_id = b.id AND q.archived = 0 AND LOWER(COALESCE(q.status, '')) NOT IN ('void', 'archived')
+                          ORDER BY q.version DESC, q.id DESC LIMIT 1),
+                        b.total_amount, 0)
+                    ELSE 0 END AS gross,
+                    COALESCE((SELECT SUM(t.amount) FROM transactions t
+                               WHERE t.booking_id = b.id AND t.transaction_type IN ('refund', 'chargeback') AND ${revenueRowsSql('t')}), 0) AS refunded
+             FROM bookings b
+             WHERE b.id = ?`,
+            [bookingId], (e2, fin) => {
+                if (e2) return res.status(500).json({ success: false, message: e2.message });   // never present a failed lookup as R0.00 revenue
+                const gross = fin ? parseFloat(fin.gross || 0) : 0;
+                const refunded = fin ? parseFloat(fin.refunded || 0) : 0;
+                res.json({
+                    success: true,
+                    expenses: expenses || [],
+                    total_expenses: totalExpenses,
+                    gross_revenue: gross,
+                    refunded,
+                    net_profit: gross - refunded - totalExpenses
+                });
+            }
+        );
+    });
+});
+
+// 5. Booking-Specific Financial Details (Admin)
+
+router.get('/api/admin/bookings/:id/financials', requireAdmin, requireRole(['administrator', 'manager']), (req, res) => {
+    const bookingId = req.params.id;
+    const result = { quote: null, invoice: null };
+
+    getQuoteForBookingFinancials(bookingId, (err, quote) => {
+        if (quote) {
+            result.quote = {
+                id: quote.id,
+                quote_number: quote.quote_number,
+                pdf_url: `/api/admin/bookings/${bookingId}/quote/${quote.id}/download`,   // not /docs/ - that path is blocked
+                created_at: quote.created_at
+            };
+        }
+
+        getInvoiceForBookingFinancials(bookingId, (err, invoice) => {
+            if (invoice) {
+                result.invoice = {
+                    id: invoice.id,
+                    invoice_number: invoice.invoice_number,
+                    pdf_url: `/api/admin/bookings/${bookingId}/invoice/download`,   // the live invoice, through the authenticated route
+                    status: invoice.status,
+                    total_amount: invoice.total_amount
+                };
+            }
+            res.json(result);
+        });
+    });
+});
+
+// P2.0 — Cancellation Preview
+router.get('/api/admin/bookings/:id/cancellation-preview', requireAdmin, (req, res) => {
+    const bookingId = req.params.id;
+    db.get("SELECT * FROM bookings WHERE id = ?", [bookingId], (err, booking) => {
+        if (err || !booking) return res.status(404).json({ success: false, message: 'Booking not found.' });
+        if (['COMPLETED', 'CANCELLED'].includes((booking.status || '').toUpperCase())) {
+            return res.status(400).json({ success: false, message: `Booking already ${booking.status}` });
+        }
+        
+        db.get("SELECT policy_value FROM policies WHERE policy_key = 'cancellation_policy'", (err, policy) => {
+            const policyStr = policy ? policy.policy_value : "";
+            const calc = calculateCancellationRefund(booking, policyStr);
+            res.json({ success: true, preview: calc });
+        });
+    });
+});
+
+// P2.0 — Reopen an EXPIRED booking — resets to PENDING so admin can issue a new quote
+router.post('/api/admin/bookings/:id/reopen', requireAdmin, (req, res) => {
+    const bookingId = parseInt(req.params.id, 10);
+    getBookingStatusNameEmail(bookingId, (err, booking) => {
+        if (err || !booking) return res.status(404).json({ success: false, message: 'Booking not found.' });
+        if ((booking.status || '').toUpperCase() !== 'EXPIRED') {
+            return res.status(400).json({ success: false, message: `Only EXPIRED bookings can be reopened. Current status: ${booking.status}.` });
+        }
+        reopenBooking(
+            bookingId,
+            function(upErr) {
+                if (upErr) return res.status(500).json({ success: false, message: upErr.message });
+                db.run(
+                    `INSERT INTO audit_log (table_name, record_id, action, old_values, new_values, changed_by, change_timestamp)
+                     VALUES ('bookings', ?, 'REOPEN', ?, ?, ?, CURRENT_TIMESTAMP)`,
+                    [bookingId,
+                     JSON.stringify({ status: 'EXPIRED' }),
+                     JSON.stringify({ status: 'PENDING', note: 'Reopened by admin, previous quote cleared' }),
+                     req.session.adminId || 'admin']
+                );
+                res.json({ success: true, message: 'Booking reopened and returned to PENDING.' });
+            }
+        );
+    });
+});
+
+// 2. Ledger reconciliation — compares booking's denormalised ledger against transaction sum.
+router.get('/api/admin/bookings/:id/reconcile', requireAdmin, (req, res) => {
+    const bookingId = req.params.id;
+    db.get(
+        `SELECT
+            b.id, b.amount_paid AS ledger_paid, b.amount_outstanding AS ledger_outstanding, b.total_amount AS ledger_total,
+            COALESCE(SUM(CASE WHEN (t.source != 'payfast' OR t.is_verified = 1) AND COALESCE(t.is_duplicate, 0) = 0 AND t.status = 'completed' THEN (CASE WHEN t.transaction_type = 'refund' THEN -t.amount WHEN t.transaction_type = 'adjustment' THEN 0 ELSE t.amount END) ELSE 0 END), 0) AS tx_paid,
+            COUNT(t.id) AS tx_count
+         FROM bookings b
+         LEFT JOIN transactions t ON t.booking_id = b.id
+         WHERE b.id = ?
+         GROUP BY b.id`,
+        [bookingId],
+        (err, row) => {
+            if (err || !row) return res.status(404).json({ success: false, message: 'Booking not found.' });
+            const drift = Math.abs((row.ledger_paid || 0) - (row.tx_paid || 0)) > 0.01;
+            res.json({
+                success: true,
+                booking_id: row.id,
+                ledger: { total: row.ledger_total, paid: row.ledger_paid, outstanding: row.ledger_outstanding },
+                transactions: { total_paid: row.tx_paid, count: row.tx_count },
+                drift,
+                drift_amount: drift ? ((row.ledger_paid || 0) - (row.tx_paid || 0)).toFixed(2) : '0.00'
+            });
+        }
+    );
+});
+
+// 2b. Download Invoice (Admin Authorized)
+router.get('/api/admin/bookings/:id/invoice/download', requireAdmin, (req, res) => {
+    // Same as the public route: serve the live invoice, never a superseded VOID revision.
+    getInvoiceFileForAdminDownload(req.params.id, async (err, row) => {
+
+        if (err || !row) return res.status(404).send('Invoice not found');
+
+        const doc = await objectStorage.resolveDocument('invoices', row.file_path);
+        if (!doc) return res.status(404).send('Physical PDF file not found on server.');
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `attachment; filename=Invoice_${row.invoice_number}.pdf`);
+        if (doc.stream) doc.stream.pipe(res); else res.sendFile(doc.diskPath);
+    });
+});
+
+// 2c. Download Quote (Admin Authorized)
+router.get('/api/admin/bookings/:id/quote/download', requireAdmin, (req, res) => {
+    getQuoteFileForAdminDownload(req.params.id, async (err, row) => {
+
+        if (err || !row) return res.status(404).send('Quotation not found');
+
+        const doc = await objectStorage.resolveDocument('quotes', row.file_path);
+        if (!doc) return res.status(404).send('Physical PDF file not found on server.');
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `attachment; filename=Quote_${row.quote_number}.pdf`);
+        if (doc.stream) doc.stream.pipe(res); else res.sendFile(doc.diskPath);
+    });
+});
+
+// 2d. View ONE quotation version (Admin Authorized). The quote files sit behind the site's blocked /docs/ path (app.js refuses every
+// /docs/ URL), so a link straight to /docs/quotes/<file>.pdf can never open - that is what the Files tab chip and the quote history
+// list used to point at. They link here instead, and the PDF opens inline in the browser tab. The id must belong to the booking in the URL.
+router.get('/api/admin/bookings/:id/quote/:quoteId/download', requireAdmin, (req, res) => {
+    if (!/^\d+$/.test(String(req.params.quoteId))) return res.status(404).send('Quotation not found');
+    getQuoteFileForAdminDownloadById(req.params.id, req.params.quoteId, async (err, row) => {
+        if (err || !row) return res.status(404).send('Quotation not found');
+
+        const doc = await objectStorage.resolveDocument('quotes', row.file_path);
+        if (!doc) return res.status(404).send('Physical PDF file not found on server.');
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `inline; filename="Quote_${row.quote_number}_v${row.version || 1}.pdf"`);
+        if (doc.stream) doc.stream.pipe(res); else res.sendFile(doc.diskPath);
+    });
+});
+
+// POST — generate a booking contract PDF (admin, on demand). `{ clauses }` in the body drives the
+// Contract Builder path; an empty/absent body keeps today's zero-customization auto-generate
+// behavior. Signed contracts are protected.
+router.post('/api/admin/bookings/:id/contract/generate', requireAdmin, async (req, res) => {
+    try {
+        const result = await generateContract(req.params.id, (req.body && req.body.clauses) || null);
+        if (result.skipped) {
+            const msg = result.reason === 'not_accepted'
+                ? 'A contract can only be generated once the quote has been accepted. Accept the quote first.'
+                : 'This contract has already been signed and cannot be regenerated. Create a separate amendment instead.';
+            return res.status(400).json({ success: false, message: msg });
+        }
+        res.json({ success: true, message: 'Contract generated.', contract: result.contract });
+    } catch (e) {
+        console.error('[Contract Generate] Failed for booking #' + req.params.id + ':', e.message);
+        res.status(500).json({ success: false, message: 'Failed to generate contract: ' + e.message });
+    }
+});
+
+// GET — pre-fill data for the Contract Builder editor: booking/party facts, resolved fee/schedule,
+// policy defaults, and (if a draft already exists) the last-submitted clause text so re-opening
+// the editor restores prior edits instead of resetting to raw defaults.
+router.get('/api/admin/bookings/:id/contract/builder-data', requireAdmin, async (req, res) => {
+    try {
+        const bookingId = req.params.id;
+        const booking = await dbGet(
+            `SELECT b.*, c.vat_number AS client_vat_number FROM bookings b LEFT JOIN clients c ON b.client_id = c.id WHERE b.id = ?`,
+            [bookingId]);
+        if (!booking) return res.status(404).json({ success: false, message: 'Booking not found.' });
+
+        const feeData = await resolveContractFeeData(bookingId, booking);
+
+        const policyRows = await new Promise(r => db.all("SELECT policy_key, policy_value FROM policies", [], (e, rows) => r(e ? [] : (rows || []))));
+        const policies = {};
+        policyRows.forEach(p => { policies[p.policy_key] = p.policy_value; });
+
+        const artist = await dbGet("SELECT stage_name AS name, email, phone FROM comedians WHERE id = 1");
+        const manager = await dbGet("SELECT name, email, cell_number AS phone FROM manager_details ORDER BY manager_id ASC LIMIT 1");
+
+        const existingContract = await dbGet("SELECT status, is_frozen, builder_clauses FROM contracts WHERE booking_id = ?", [bookingId]);
+        let savedClauses = null;
+        if (existingContract && existingContract.builder_clauses) {
+            try { savedClauses = JSON.parse(existingContract.builder_clauses); } catch (e) {}
+        }
+        const clauses = savedClauses || {
+            paymentTerms: policies.payment_terms || '',
+            cancellation: policies.cancellation_policy || DEFAULT_CONTRACT_CLAUSES.cancellation,
+            forceMajeure: DEFAULT_CONTRACT_CLAUSES.forceMajeure,
+            travelHospitality: DEFAULT_CONTRACT_CLAUSES.travelHospitality,
+            rightsRecording: DEFAULT_CONTRACT_CLAUSES.rightsRecording,
+            additionalClauses: DEFAULT_CONTRACT_CLAUSES.additionalClauses
+        };
+
+        res.json({
+            success: true,
+            booking: { name: booking.name, company: booking.company, email: booking.email, cell: booking.cell,
+                       vat_number: booking.vat_number || booking.client_vat_number, event_name: booking.event_name,
+                       event_type: booking.event_type, date: booking.date, event_location: booking.event_location },
+            artist: artist || null,
+            manager: manager || null,
+            fee: { total: feeData.total, applyVat: feeData.applyVat, schedules: feeData.schedules },
+            clauses,
+            locked: !!(existingContract && (existingContract.status === 'signed' || existingContract.is_frozen === 1))
+        });
+    } catch (e) {
+        console.error('[Contract Builder Data] Failed for booking #' + req.params.id + ':', e.message);
+        res.status(500).json({ success: false, message: 'Could not load contract builder data.' });
+    }
+});
+
+// POST — stateless HTML preview of the contract as currently drafted in the Builder. No DB write,
+// no PDF/file write — just runs the same assembly function generate() uses, so preview always
+// matches what Generate would actually produce.
+router.post('/api/admin/bookings/:id/contract/preview', requireAdmin, async (req, res) => {
+    try {
+        const bookingId = req.params.id;
+        const booking = await dbGet(
+            `SELECT b.*, c.vat_number AS client_vat_number FROM bookings b LEFT JOIN clients c ON b.client_id = c.id WHERE b.id = ?`,
+            [bookingId]);
+        if (!booking) return res.status(404).json({ success: false, message: 'Booking not found.' });
+
+        const feeData = await resolveContractFeeData(bookingId, booking);
+        const policyRows = await new Promise(r => db.all("SELECT policy_key, policy_value FROM policies", [], (e, rows) => r(e ? [] : (rows || []))));
+        const policies = {};
+        policyRows.forEach(p => { policies[p.policy_key] = p.policy_value; });
+
+        const submitted = (req.body && req.body.clauses) || {};
+        const finalClauses = {
+            paymentTerms: submitted.paymentTerms || policies.payment_terms || '',
+            cancellation: submitted.cancellation || policies.cancellation_policy || DEFAULT_CONTRACT_CLAUSES.cancellation,
+            forceMajeure: submitted.forceMajeure || DEFAULT_CONTRACT_CLAUSES.forceMajeure,
+            travelHospitality: submitted.travelHospitality || DEFAULT_CONTRACT_CLAUSES.travelHospitality,
+            rightsRecording: submitted.rightsRecording || DEFAULT_CONTRACT_CLAUSES.rightsRecording,
+            additionalClauses: submitted.additionalClauses || DEFAULT_CONTRACT_CLAUSES.additionalClauses,
+            depositPercentage: policies.deposit_percentage || '50'
+        };
+
+        const contractNo = `AGR-${moment().format('YYYY')}-${String(bookingId).padStart(4, '0')}`;
+        const contentHtml = assembleContractHtml(booking, feeData, finalClauses, contractNo);
+        res.json({ success: true, content_html: contentHtml });
+    } catch (e) {
+        console.error('[Contract Preview] Failed for booking #' + req.params.id + ':', e.message);
+        res.status(500).json({ success: false, message: 'Could not render preview.' });
+    }
+});
+
+// GET — fetch contract details for a booking
+router.get('/api/admin/bookings/:id/contract', requireAdmin, (req, res) => {
+    db.get("SELECT * FROM contracts WHERE booking_id = ?", [req.params.id], (err, row) => {
+        if (err) return res.status(500).json({ success: false, message: err.message });
+        res.json({ success: true, contract: row || null });
+    });
+});
+
+// POST — upload a contract PDF
+router.post('/api/admin/bookings/:id/contract', requireAdmin, (req, res, next) => {
+    contractUpload.single('contract_file')(req, res, function(err) {
+        if (err) {
+            // multer fileFilter error — return clear 400
+            return res.status(400).json({ success: false, message: err.message || 'Invalid file. Only PDF files are accepted.' });
+        }
+        next();
+    });
+}, (req, res) => {
+    if (!req.file) return res.status(400).json({ success: false, message: 'A PDF file is required. Only .pdf files are accepted.' });
+    const bookingId = req.params.id;
+    const pdfUrl = req.file.filename;
+    const templateVersion = (req.body.template_version || '1.0').substring(0, 20);
+    const uploadedBy = req.session.username || 'system';
+
+    getBookingStatus(bookingId, (bErr, bk) => {
+        if (bErr || !bk) return res.status(404).json({ success: false, message: 'Booking not found.' });
+        // Acceptance-before-contract: don't attach a contract to a booking that hasn't accepted its quote.
+        if (!CONTRACT_ELIGIBLE_STATUSES.includes((bk.status || '').toUpperCase())) {
+            return res.status(400).json({ success: false, message: 'The quote must be accepted before a contract can be added.' });
+        }
+    db.get("SELECT status, is_frozen, signed_by, signed_date FROM contracts WHERE booking_id = ?", [bookingId], (selErr, existing) => {
+        if (existing && (existing.status === 'signed' || existing.is_frozen === 1)) {
+            return res.status(400).json({
+                success: false,
+                message: `Cannot overwrite: this contract was already signed by "${existing.signed_by}" on ${existing.signed_date}. You cannot replace a signed contract. Create a separate amendment instead.`
+            });
+        }
+
+        const previousStatus = existing ? existing.status : null;
+
+        db.run(
+            `INSERT INTO contracts (booking_id, template_version, pdf_url, status, uploaded_by, updated_at)
+             VALUES (?, ?, ?, 'draft', ?, CURRENT_TIMESTAMP)
+             ON CONFLICT(booking_id) DO UPDATE SET
+                pdf_url = excluded.pdf_url,
+                template_version = excluded.template_version,
+                status = 'draft',
+                uploaded_by = excluded.uploaded_by,
+                is_frozen = 0,
+                updated_at = CURRENT_TIMESTAMP`,
+            [bookingId, templateVersion, pdfUrl, uploadedBy], function(err) {
+                if (err) return res.status(500).json({ success: false, message: err.message });
+
+                db.run(
+                    `INSERT INTO audit_log (table_name, record_id, action, changed_by, changes_json)
+                     VALUES ('contracts', ?, 'UPLOAD', ?, ?)`,
+                    [bookingId, uploadedBy, JSON.stringify({ file: pdfUrl, status: 'draft', previous_status: previousStatus })],
+                    () => {}
+                );
+
+                res.json({ success: true, message: 'Contract uploaded successfully.', filename: pdfUrl, uploaded_by: uploadedBy });
+            }
+        );
+    });
+    });
+});
+
+// PUT — mark a contract as signed
+router.put('/api/admin/bookings/:id/contract/sign', requireAdmin, (req, res) => {
+    const bookingId = req.params.id;
+    const signatoryName = (req.body.signatory_name || '').trim().substring(0, 120);
+    const signedDate = (req.body.signed_date || new Date().toISOString().split('T')[0]);
+    const signedBy = req.session.username || 'system';
+
+    if (!signatoryName) {
+        return res.status(400).json({ success: false, message: 'Signatory name is required to mark as signed.' });
+    }
+
+    const forceCountersign = req.body && req.body.force === true;
+    db.get("SELECT status, is_frozen, signed_by_client_at, pdf_url, client_signature_data FROM contracts WHERE booking_id = ?", [bookingId], async (checkErr, existing) => {
+        if (checkErr) return res.status(500).json({ success: false, message: checkErr.message });
+        if (!existing) return res.status(404).json({ success: false, message: 'No contract found for this booking. Upload a PDF first.' });
+        if (existing.is_frozen === 1 || existing.status === 'signed') {
+            return res.status(400).json({ success: false, message: 'This contract has already been signed and cannot be re-signed.' });
+        }
+        // Two-party model: the client signs online first, then the admin/comedian countersigns to
+        // finalise. Block the countersign until the client has signed, unless explicitly overridden.
+        if (!existing.signed_by_client_at && !forceCountersign) {
+            return res.status(400).json({
+                success: false,
+                requires_client_signature: true,
+                message: 'The client has not signed this contract yet. Send it for signing first, or pass { force: true } to countersign anyway.'
+            });
+        }
+
+        // Integrity check: re-hash the PDF now and compare against the hash captured when the client
+        // signed. A mismatch means the document changed between the client's signature and this
+        // countersignature — surfaced in the audit trail (not hard-blocked; the admin is finalising).
+        let integrityVerified = null;
+        try {
+            let clientHash = null;
+            if (existing.client_signature_data) {
+                try { clientHash = (JSON.parse(existing.client_signature_data) || {}).signed_file_sha256 || null; } catch (pe) {}
+            }
+            if (clientHash && existing.pdf_url) {
+                const cpath = resolveDocsPath('contracts', existing.pdf_url);
+                if (await objectStorage.fileExists(cpath)) {
+                    const nowHash = crypto.createHash('sha256').update(await objectStorage.readFile(cpath)).digest('hex');
+                    integrityVerified = (nowHash === clientHash);
+                    if (integrityVerified === false) console.warn(`[Contract Countersign] PDF hash changed since client signed (booking #${bookingId}) — possible tamper.`);
+                }
+            }
+        } catch (hErr) { console.error('[Contract Countersign] Integrity check failed for booking #' + bookingId + ':', hErr.message); }
+
+        db.run(
+            `UPDATE contracts
+             SET signed_by_comedian_at = CURRENT_TIMESTAMP,
+                 signed_by = ?,
+                 signed_date = ?,
+                 status = 'signed',
+                 is_frozen = 1,
+                 integrity_verified = ?,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE booking_id = ?`,
+            [signatoryName, signedDate, integrityVerified === null ? null : (integrityVerified ? 1 : 0), bookingId], function(err) {
+                if (err || this.changes === 0) {
+                    return res.status(404).json({ success: false, message: err ? err.message : 'No contract found for this booking. Upload a PDF first.' });
+                }
+
+                // Audit log (previously passed 5 params to a 3-placeholder INSERT — the extra literals
+                // meant the row silently failed to write; corrected to match the columns).
+                db.run(
+                    `INSERT INTO audit_log (table_name, record_id, action, changed_by, changes_json)
+                     VALUES ('contracts', ?, 'SIGN', ?, ?)`,
+                    [bookingId, signedBy, JSON.stringify({ signed_by: signatoryName, signed_date: signedDate, integrity_verified: integrityVerified })],
+                    () => {}
+                );
+
+                require('../../lib/notify').resolve('bookings.contract_signed', bookingId, { req, note: `Countersigned by ${signatoryName}.` });
+                res.json({ success: true, message: 'Contract marked as signed.', signed_by: signatoryName, signed_date: signedDate, integrity_verified: integrityVerified });
+            }
+        );
+    });
+});
+
+// GET — download the contract PDF
+router.get('/api/admin/bookings/:id/contract/download', requireAdmin, (req, res) => {
+    db.get("SELECT pdf_url FROM contracts WHERE booking_id = ?", [req.params.id], async (err, row) => {
+        if (err || !row || !row.pdf_url) return res.status(404).json({ success: false, message: 'No contract on file for this booking.' });
+        const doc = await objectStorage.resolveDocument('contracts', row.pdf_url);
+        if (!doc) return res.status(404).json({ success: false, message: 'Contract file not found on server. It may have been deleted.' });
+        if (doc.stream) {
+            res.setHeader('Content-Type', doc.contentType);
+            res.setHeader('Content-Disposition', `attachment; filename="${row.pdf_url}"`);
+            doc.stream.pipe(res);
+        } else {
+            res.download(doc.diskPath, row.pdf_url, (dlErr) => {
+                if (dlErr) console.error('[Contract Download Error]', dlErr.message);
+            });
+        }
+    });
+});
+
+// POST — send the generated contract to the client for online signing.
+// Draft-only generation means this is the explicit "deliver it" step; it stamps sent_to_client_at
+// and advances draft -> sent so the client tracking page exposes the review-and-sign flow.
+router.post('/api/admin/bookings/:id/contract/send', requireAdmin, mutateRateLimiter, (req, res) => {
+    const bookingId = req.params.id;
+    db.get(`SELECT b.id, b.name, b.status, COALESCE(c.email, b.email) AS email, b.event_name, b.event_type, b.date
+            FROM bookings b LEFT JOIN clients c ON b.client_id = c.id WHERE b.id = ?`, [bookingId], (err, booking) => {
+        if (err || !booking) return res.status(404).json({ success: false, message: 'Booking not found.' });
+        // Acceptance-before-contract: a contract may not be sent for signing before the quote is accepted.
+        if (!CONTRACT_ELIGIBLE_STATUSES.includes((booking.status || '').toUpperCase())) {
+            return res.status(400).json({ success: false, message: 'The quote must be accepted before a contract can be sent to the client.' });
+        }
+        db.get("SELECT pdf_url, status, is_frozen FROM contracts WHERE booking_id = ?", [bookingId], async (cErr, contract) => {
+            if (cErr) return res.status(500).json({ success: false, message: cErr.message });
+            if (!contract || !contract.pdf_url) return res.status(404).json({ success: false, message: 'No contract on file. Generate or upload one first.' });
+            if (contract.status === 'signed' || contract.is_frozen === 1) {
+                return res.status(400).json({ success: false, message: 'This contract is already signed and finalised.' });
+            }
+            const pdfPath = resolveDocsPath('contracts', contract.pdf_url);
+            if (!await objectStorage.fileExists(pdfPath)) return res.status(404).json({ success: false, message: 'Contract file not found on server. Regenerate it first.' });
+
+            try {
+                await sendContractEmail(booking, pdfPath);
+            } catch (e) {
+                console.error('[Contract Send] email failed for booking #' + bookingId + ':', e.message);
+                return res.status(500).json({ success: false, message: 'Could not email the contract: ' + e.message });
+            }
+            // Only advance a draft to sent; a re-send of an already-sent (possibly client-signed)
+            // contract just refreshes the timestamp without downgrading its status.
+            db.run(
+                `UPDATE contracts SET status = CASE WHEN status = 'draft' THEN 'sent' ELSE status END,
+                        sent_to_client_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                 WHERE booking_id = ?`,
+                [bookingId],
+                (uErr) => {
+                    if (uErr) console.error('[Contract Send] status update failed:', uErr.message);
+                    db.run(`INSERT INTO audit_log (table_name, record_id, action, changed_by, changes_json)
+                            VALUES ('contracts', ?, 'SENT', ?, ?)`,
+                        [bookingId, req.session.username || 'admin', JSON.stringify({ to: booking.email })], () => {});
+                    res.json({ success: true, message: 'Contract sent to the client for signing.' });
+                }
+            );
+        });
+    });
+});
+
+// Gap 8: POST — send contract signature reminder email to client
+router.post('/api/admin/bookings/:id/contract/remind', requireAdmin, mutateRateLimiter, (req, res) => {
+    const bookingId = req.params.id;
+    getBookingForContractRemind(bookingId, (err, b) => {
+        if (err || !b) return res.status(404).json({ success: false, message: 'Booking not found.' });
+
+        // Idempotency: this route wrote nothing and had no throttle, so the reminder could be sent
+        // repeatedly. contracts.sent_to_client_at is the natural "last contacted about signing"
+        // timestamp and was never populated; use it to refuse a repeat within 24h and to record sends.
+        db.get("SELECT sent_to_client_at FROM contracts WHERE booking_id = ?", [bookingId], (cErr, contract) => {
+            const lastSent = contract && contract.sent_to_client_at ? moment(contract.sent_to_client_at) : null;
+            if (lastSent && moment().diff(lastSent, 'hours') < 24 && !(req.body && req.body.force === true)) {
+                return res.status(429).json({
+                    success: false,
+                    message: `A contract reminder was already sent on ${lastSent.format('YYYY-MM-DD HH:mm')}. Wait 24 hours, or resend with { force: true }.`,
+                    last_sent_at: contract.sent_to_client_at
+                });
+            }
+
+            getEmailFooterContext().then(async ({ socialLinks }) => {
+                const banner = await bannerRegistry.resolveBanner('contract_sign_reminder');
+                return sendEmail({
+                    to: b.email,
+                    subject: `Action Required: Please sign your booking contract (${b.event_name})`,
+                    htmlContent: emailComponents.renderPremiumEmail({
+                        preheaderText: `Your booking contract for ${b.event_name} is awaiting your signature.`,
+                        bannerSrc: banner?.src, bannerAlt: banner?.alt, subtitle: banner?.subtitle,
+                        headline: banner?.headline || 'Contract Signature Reminder',
+                        greeting: `Hi ${b.name},`,
+                        bodyHtml:
+                            `A friendly reminder that your booking contract for <strong style="color:#FAFAFA;">${b.event_name}</strong> on ${b.date} is awaiting your signature.` +
+                            `<p style="margin:10px 0 0; color:#E6E6E6;">Please contact us at your earliest convenience to arrange signing.</p>`,
+                        socialLinks
+                    }),
+                    preWrapped: true,
+                    titleOverride: 'Contract Signature Reminder',
+                    trigger_event: 'Admin: Contract Remind'
+                });
+            }).then(() => {
+                // Only stamp a contract row that already exists; the reminder can predate the upload.
+                db.run("UPDATE contracts SET sent_to_client_at = CURRENT_TIMESTAMP WHERE booking_id = ?", [bookingId],
+                    (uErr) => { if (uErr) console.error('[Contract Remind] timestamp update failed:', uErr.message); });
+                res.json({ success: true, message: 'Reminder sent.' });
+            }).catch(e => res.status(500).json({ success: false, message: e.message }));
+        });
+    });
+});
+
+// State-aware per-booking reminder. Picks the reminder appropriate to where the booking is in the
+// lifecycle and returns what it did. Shared by the single-booking route and the bulk action.
+// Throttling reuses existing state: the contract reminder is gated by contracts.sent_to_client_at,
+// the balance reminder by a reminders_log row (schedule_id NULL, days_before=0 sentinel — distinct
+// from the 7/3/1 pre-event reminders and the milestone reminders which carry a non-NULL schedule_id).
+// Phase 5 (HOUSEKEEPING-NOTES.md): remindBooking moved to lib/booking-notifications.js — no
+// remaining caller in app.js.
+
+// POST — send the state-appropriate reminder for one booking.
+router.post('/api/admin/bookings/:id/remind', requireAdmin, async (req, res) => {
+    try {
+        const result = await remindBooking(req.params.id);
+        res.json({ success: true, ...result });
+    } catch (e) {
+        console.error('[Remind] failed for booking #' + req.params.id + ':', e.message);
+        res.status(500).json({ success: false, message: e.message });
+    }
+});
+
+// POST — bulk "Send reminder": each selected booking gets the reminder appropriate to its state.
+router.post('/api/admin/bookings/bulk-remind', requireAdmin, requireRole(['administrator', 'manager']), async (req, res) => {
+    const ids = Array.isArray(req.body.ids) ? req.body.ids.map(n => parseInt(n, 10)).filter(n => !isNaN(n)) : [];
+    if (ids.length === 0) return res.status(400).json({ success: false, message: 'No bookings selected.' });
+    if (ids.length > 200) return res.status(400).json({ success: false, message: 'Too many bookings selected (max 200).' });
+
+    let sent = 0, skipped = 0, failed = 0;
+    const breakdown = { quote: 0, contract: 0, balance: 0 };
+    const errors = [];
+    for (const id of ids) {
+        try {
+            const r = await remindBooking(id);
+            if (r.sent) { sent++; if (breakdown[r.type] !== undefined) breakdown[r.type]++; }
+            else skipped++;
+        } catch (e) { failed++; errors.push(`#${id}: ${e.message}`); }
+    }
+    res.json({ success: true, sent, skipped, failed, breakdown, errors: errors.length ? errors : undefined });
+});
+
+// --- Booking Email Actions ---
+router.post('/api/admin/bookings/:id/resend-quote', requireAdmin, async (req, res) => {
+    db.get(`SELECT b.*, COALESCE(c.full_name, b.name) as client_name, COALESCE(c.email, b.email) as client_email
+            FROM bookings b LEFT JOIN clients c ON b.client_id = c.id WHERE b.id = ?`,
+        [req.params.id], async (err, b) => {
+            if (err || !b) return res.status(404).json({ success: false });
+            b.name = b.client_name || b.name; b.email = b.client_email || b.email;
+            getLatestQuoteFileForResend(
+                req.params.id, async (e, q) => {
+                    if (!q) return res.status(404).json({ success: false, message: 'No quote found for this booking. Generate a quote first.' });
+                    const pdfPath = resolveDocsPath('quotes', q.file_path);
+                    await sendQuoteEmail(b, b.quote_amount, pdfPath, q.file_path);
+                    markQuotationResent(req.params.id, () => {});
+                    res.json({ success: true, message: 'Quote email resent.' });
+                });
+        });
+});
+
+router.post('/api/admin/bookings/:id/resend-confirmation', requireAdmin, async (req, res) => {
+    db.get(`SELECT b.*, COALESCE(c.full_name, b.name) as client_name, COALESCE(c.email, b.email) as client_email
+            FROM bookings b LEFT JOIN clients c ON b.client_id = c.id WHERE b.id = ?`,
+        [req.params.id], async (err, b) => {
+            if (err || !b) return res.status(404).json({ success: false });
+            if (['CANCELLED', 'EXPIRED'].includes(b.status)) {
+                return res.status(400).json({ success: false, message: `Cannot resend confirmation for a ${b.status} booking.` });
+            }
+            b.name = b.client_name || b.name; b.email = b.client_email || b.email;
+            await sendBookingConfirmedEmail(b);
+            res.json({ success: true, message: 'Confirmation email resent.' });
+        });
+});
+
+router.post('/api/admin/bookings/:id/review-request', requireAdmin, (req, res) => {
+    db.get(`SELECT b.*, COALESCE(c.full_name, b.name) as name, COALESCE(c.email, b.email) as email
+            FROM bookings b LEFT JOIN clients c ON b.client_id = c.id WHERE b.id = ?`,
+        [req.params.id], async (err, b) => {
+            if (err || !b) return res.status(404).json({ success: false });
+            if (b.status !== 'COMPLETED') return res.status(400).json({ success: false, message: 'Booking not completed.' });
+            await sendReviewRequestEmail(b);
+            // The cron (runPostEventFollowupJob) only sends when review_email_sent_at IS NULL — this
+            // manual trigger never stamped it, so an admin clicking "Request Review" the same day an
+            // event completes would get a second, duplicate auto-send from the cron the next day.
+            stampReviewEmailSent(b.id);
+            res.json({ success: true });
+        });
+});
+
+// P2.0b — Book Again — creates a new PENDING booking pre-filled from a CANCELLED booking
+router.post('/api/admin/bookings/:id/book-again', requireAdmin, async (req, res) => {
+    const originalId = parseInt(req.params.id, 10);
+    getBookingById(originalId, async (err, orig) => {
+        if (err || !orig) return res.status(404).json({ success: false, message: 'Booking not found.' });
+        if ((orig.status || '').toUpperCase() !== 'CANCELLED') {
+            return res.status(400).json({ success: false, message: `Only CANCELLED bookings can be rebooked. Current status: ${orig.status}.` });
+        }
+
+        // The original date is only free because this booking is CANCELLED — it's excluded from
+        // every conflict query. Someone else may have taken it since. Re-check before recreating a
+        // live NEW booking on it, the same way every other booking-creation path does.
+        if (!(req.body && req.body.override_conflict === true)) {
+            try {
+                let conflict;
+                if (orig.event_start_time) {
+                    const durationMins = (orig.performance_end_time && orig.event_start_time)
+                        ? (() => {
+                            const [eh, em] = orig.performance_end_time.split(':').map(Number);
+                            const [sh, sm] = orig.event_start_time.split(':').map(Number);
+                            return Math.max((eh * 60 + em) - (sh * 60 + sm), 30);
+                          })()
+                        : (parseDurationToMinutes(orig.performance_duration) || 120);
+                    const startISO = moment(`${orig.date} ${orig.event_start_time}`).toISOString();
+                    const endISO = moment(startISO).add(durationMins, 'minutes').toISOString();
+                    conflict = await hasCalendarConflict(startISO, endISO);
+                } else {
+                    const avail = await new Promise((resolve, reject) =>
+                        checkDateAvailability(orig.date, (e, r) => e ? reject(e) : resolve(r)));
+                    conflict = !avail.available || (avail.busy_ranges && avail.busy_ranges.length > 0);
+                }
+                if (conflict) {
+                    return res.status(409).json({
+                        success: false,
+                        conflict: true,
+                        message: `${orig.date} is no longer free, as it has since been booked or blocked. Choose a different date, or pass override_conflict:true to rebook on this date anyway.`
+                    });
+                }
+            } catch (availErr) {
+                console.error('[Book Again] Availability check failed:', availErr.message);
+                return res.status(503).json({ success: false, message: 'Could not confirm availability just now. Please try again.' });
+            }
+        }
+
+        // Copy client + event fields; reset all financial and lifecycle fields
+        insertBookAgainBooking(
+            [
+                orig.name, orig.company || null, orig.email, orig.cell,
+                orig.event_name || null, orig.date, orig.event_start_time || null, orig.performance_slot || null, orig.performance_duration || null,
+                orig.event_location, orig.venue_address || null, orig.city || null, orig.country || null, orig.venue_type || null,
+                orig.event_type, orig.audience_size || null, orig.audience_demographic || null, orig.budget_range || null,
+                orig.travel_accommodation || 0, orig.message || '',
+                originalId
+            ],
+            function(insErr) {
+                if (insErr) return res.status(500).json({ success: false, message: insErr.message });
+                const newId = this.lastID;
+                // Audit on old booking
+                db.run(
+                    `INSERT INTO audit_log (table_name, record_id, action, new_values, changed_by, change_timestamp)
+                     VALUES ('bookings', ?, 'REBOOKED', ?, ?, CURRENT_TIMESTAMP)`,
+                    [originalId,
+                     JSON.stringify({ new_booking_id: newId, note: 'Client rebooked: new booking created from this cancelled record' }),
+                     req.session.adminId || 'admin']
+                );
+                // Audit on new booking
+                db.run(
+                    `INSERT INTO audit_log (table_name, record_id, action, new_values, changed_by, change_timestamp)
+                     VALUES ('bookings', ?, 'CREATE', ?, ?, CURRENT_TIMESTAMP)`,
+                    [newId,
+                     JSON.stringify({ status: 'NEW', rebooked_from_id: originalId, note: 'Created via Book Again from cancelled booking' }),
+                     req.session.adminId || 'admin']
+                );
+                res.json({ success: true, message: `New booking #${newId} created from cancelled booking #${originalId}.`, new_booking_id: newId });
+            }
+        );
+    });
+});
+
+// Gap 11: POST — manually re-sync a booking to Google Calendar
+router.post('/api/admin/bookings/:id/sync-calendar', requireAdmin, async (req, res) => {
+    try {
+        await syncBookingToCalendar(parseInt(req.params.id, 10));
+        res.json({ success: true, message: 'Booking synced to Google Calendar.' });
+    } catch (err) {
+        console.error('[Calendar Sync]', err.message);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// --- Link a booking to a venue ---
+router.put('/api/admin/bookings/:id/venue', requireAdmin, (req, res) => {
+    const { venue_id } = req.body;
+    const bookingId = req.params.id;
+
+    if (!venue_id) {
+        // Unlinking
+        updateBookingVenueUnlink(
+            bookingId,
+            function(err) {
+                if (err) return res.status(500).json({ error: err.message });
+                if (this.changes === 0) return res.status(404).json({ error: 'Booking not found.' });
+
+                // Update associated event to remove venue link
+                getBookingEventId(bookingId, (eErr, bookingRow) => {
+                    if (!eErr && bookingRow && bookingRow.event_id) {
+                        unlinkEventVenue(bookingRow.event_id);
+                    }
+                });
+
+                // Sync to calendar
+                getBookingById(bookingId, (e, updated) => {
+                    if (!e && updated) {
+                        syncBookingToCalendar(updated).catch(ce => console.error('[Venue Unlink] Calendar sync failed:', ce.message));
+                    }
+                });
+
+                res.json({ success: true, message: 'Venue unlinked.' });
+            }
+        );
+    } else {
+        // Linking by venue_id (legacy)
+        db.get("SELECT * FROM venues WHERE id = ?", [venue_id], (vErr, venue) => {
+            if (vErr || !venue) return res.status(400).json({ success: false, message: 'Venue not found.' });
+
+            updateBookingVenueLinkLegacy(
+                venue.id, venue.place_id, venue.name, venue.address, venue.city, venue.country, bookingId,
+                function(err) {
+                    if (err) return res.status(500).json({ error: err.message });
+                    if (this.changes === 0) return res.status(404).json({ error: 'Booking not found.' });
+
+                    // Update associated event
+                    getBookingEventId(bookingId, (eErr, bookingRow) => {
+                        if (!eErr && bookingRow && bookingRow.event_id) {
+                            const mapLink = `https://maps.google.com/?q=${encodeURIComponent(venue.name + ' ' + (venue.address || ''))}`;
+                            updateEventVenueLegacyLink(venue.name, venue.id, mapLink, bookingRow.event_id);
+                        }
+                    });
+
+                    // Sync to calendar
+                    getBookingById(bookingId, (e, updated) => {
+                        if (!e && updated) {
+                            syncBookingToCalendar(updated).catch(ce => console.error('[Venue Link] Calendar sync failed:', ce.message));
+                        }
+                    });
+
+                    res.json({ success: true, message: 'Venue linked successfully.' });
+                }
+            );
+        });
+    }
+});
+
+// --- Link booking to a venue using Google Place details ---
+router.put('/api/admin/bookings/:id/venue-google', requireAdmin, async (req, res) => {
+    const { place_id, name, address, city, state, country, latitude, longitude } = req.body;
+    const bookingId = req.params.id;
+
+    if (!place_id || !name) {
+        return res.status(400).json({ success: false, message: 'place_id and name are required.' });
+    }
+
+    try {
+        // Shared upsert (lib/client-venue.js) — was this route's own inline copy of the same
+        // upsert-by-place_id logic every venue-creating path now goes through (2026-09-29
+        // location-search consolidation audit).
+        const venueId = await findOrCreateVenueFromPlace({
+            name, address: address || null, city: city || null, state: state || null, country: country || null,
+            placeId: place_id, latitude: latitude || null, longitude: longitude || null
+        });
+
+        updateBookingVenueGoogle(
+            venueId, place_id, name, address || null, city || null, country || null, bookingId,
+            function(err) {
+                if (err) return res.status(500).json({ success: false, message: err.message });
+                if (this.changes === 0) return res.status(404).json({ success: false, message: 'Booking not found.' });
+
+                getBookingEventId(bookingId, (eErr, bookingRow) => {
+                    if (!eErr && bookingRow && bookingRow.event_id) {
+                        const mapLink = `https://maps.google.com/?q=${encodeURIComponent(name + ' ' + (address || ''))}`;
+                        updateEventVenueGoogleLink(name, venueId, mapLink, bookingRow.event_id);
+                    }
+                });
+
+                getBookingById(bookingId, (e, updated) => {
+                    if (!e && updated) {
+                        syncBookingToCalendar(updated).catch(ce => console.error('[Venue Link] Calendar sync failed:', ce.message));
+                    }
+                });
+
+                res.json({ success: true, message: 'Venue linked successfully.' });
+            }
+        );
+    } catch(err) {
+        console.error('[Link Google Venue Error]', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// Phase 5 (HOUSEKEEPING-NOTES.md): findHoldDateConflict (single-consumer for the calendar hold
+// create/move routes) moved to routes/admin/calendar.js.
+
+
+
+
+/**
+ * PATCH /api/admin/bookings/:id/date
+ * Update booking event date and optionally time (used by FullCalendar eventDrop).
+ * Accepts: { date: "YYYY-MM-DD", time?: "HH:MM" }
+ */
+router.patch('/api/admin/bookings/:id/date', requireAdmin, async (req, res) => {
+    const { date, time } = req.body;
+    if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+        return res.status(400).json({ success: false, message: 'Valid date (YYYY-MM-DD) required.' });
+    }
+    if (time && !/^\d{2}:\d{2}$/.test(time)) {
+        return res.status(400).json({ success: false, message: 'time must be HH:MM.' });
+    }
+    try {
+        // The rules (conflict check, quote-expiry, holds and linked event follow the date, audit row, calendar re-sync, client e-mail) live in lib/booking-reschedule.js so
+        // that "use the Microsoft 365 time" on the calendar applies exactly the same ones.
+        const out = await rescheduleBooking({ bookingId: req.params.id, date, time, actorId: req.session && req.session.adminId });
+        if (!out.ok) return res.status(out.status).json({ success: false, message: out.message });
+        res.json({ success: true, newDate: out.newDate, newTime: out.newTime });
+    } catch (err) {
+        console.error('[PATCH booking date]', err);
+        res.status(500).json({ success: false, message: 'Server error updating booking date.' });
+    }
+});
+
+/**
+ * PATCH /api/admin/bookings/:id/venue
+ * S5-2: Update booking location/venue details without regenerating the full quote.
+ */
+router.patch('/api/admin/bookings/:id/venue', requireAdmin, (req, res) => {
+    const { event_location, venue_address, city, country, venue_type } = req.body;
+    if (!event_location || !event_location.trim()) {
+        return res.status(400).json({ success: false, message: 'event_location is required.' });
+    }
+    getBookingById(req.params.id, (err, row) => {
+        if (err || !row) return res.status(404).json({ success: false, message: 'Booking not found.' });
+        const oldLocation = row.event_location;
+        updateBookingVenueFreeText(
+            event_location.trim(), venue_address || null, city || null, country || null, venue_type || null, req.params.id,
+            function(upErr) {
+                if (upErr) return res.status(500).json({ success: false, error: upErr.message });
+                db.run(
+                    `INSERT INTO audit_log (table_name, record_id, action, old_values, new_values) VALUES ('bookings', ?, 'UPDATE', ?, ?)`,
+                    [req.params.id, JSON.stringify({ event_location: oldLocation }), JSON.stringify({ event_location: event_location.trim() })]
+                );
+                // Propagate to the linked event's venue fields — this free-text venue editor was the
+                // only one of the three venue-editing endpoints (PUT .../venue, PUT .../venue-google
+                // both already do this) that left events.venue_name/venue_map_link stale after a change.
+                // Reply only once the linked event is updated too, so the next read never sees a stale venue.
+                const finish = () => {
+                    getBookingById(req.params.id, (e, updated) => {
+                        if (!e && updated) {
+                            syncBookingToCalendar(updated).catch(ce => console.error('[Venue Change] Calendar sync failed:', ce.message));
+                        }
+                    });
+                    res.json({ success: true, message: 'Venue updated.' });
+                };
+                if (!row.event_id) return finish();
+                const mapLink = `https://maps.google.com/?q=${encodeURIComponent(event_location.trim() + ' ' + (venue_address || ''))}`;
+                updateEventVenueFreeText(event_location.trim(), mapLink, row.event_id, (evErr) => {
+                    if (evErr) console.error('[Venue Change] Linked event update failed:', evErr.message);
+                    finish();
+                });
+            }
+        );
+    });
+});
+
+router.post('/api/admin/bookings/:id/quote', requireAdmin, requireRole(['administrator', 'manager']), async (req, res) => {
+    const bookingId = req.params.id;
+    const isStructured = Array.isArray(req.body.items);
+    
+    db.get(`
+        SELECT b.*, c.full_name as client_name, c.email as client_email, c.phone as client_phone, c.company_name as client_company
+        FROM bookings b
+        LEFT JOIN clients c ON b.client_id = c.id
+        WHERE b.id = ?
+    `, [bookingId], async (err, booking) => {
+        try {
+            if (err || !booking) return res.status(404).json({ success: false, message: 'Booking not found' });
+
+            // Name/company stay as THIS booking's own values for the document — the shared clients
+            // row can silently diverge from what this specific booking recorded (e.g. a later,
+            // differently-named booking under the same email updates the one shared clients row),
+            // which used to make a re-quoted PDF show a different name than the booking itself.
+            // generateInvoice()/generateContract() already get this right by never overwriting it.
+            booking.email = booking.client_email || booking.email;
+            booking.cell = booking.client_phone || booking.cell;
+
+            // Ensure client_id is resolved and updated in booking record if missing
+            let clientId = booking.client_id;
+            if (!clientId) {
+                clientId = await findOrCreateClient(booking.name, booking.email, booking.cell, booking.company, booking.vat_number);
+                await new Promise((resolve, reject) => {
+                    setBookingClientId(clientId, bookingId, err => err ? reject(err) : resolve());
+                });
+                booking.client_id = clientId;
+            }
+
+
+            // WHO issues this quotation (lib/business-profile.js). It is frozen onto the quotation row below, so an invoice built from it later
+            // keeps this identity and this VAT status even if the business profile changes in between.
+            const issuer = await businessProfile.loadIssuer();
+            // VAT may only be charged by a business that is VAT-registered AND has confirmed its VAT number with SARS (Business > Business Profile).
+            // The Quote Builder greys the box out; this is the server saying the same thing to any other caller.
+            if (req.body.apply_vat && !issuer.vatRegistered) {
+                return res.status(400).json({ success: false, code: 'VAT_NOT_ACTIVE', message: 'VAT cannot be added: the business is not set up as VAT-registered with a confirmed VAT number. Update Business > Business Profile first, or send the quotation without VAT.' });
+            }
+
+            let quote_amount, quote_details, quote_expiry_date, finalTotal = 0;
+            let items = [];
+            let priceWarnings = []; // rate-card advisories (lib/service-pricing) returned with the success response
+            let individuallyQuoted = false; // true when a line is for a service priced individually (adds a note to the conditions)
+
+            if (isStructured) {
+                const { quote_expiry_date: expiry, terms, items: bodyItems, discount, apply_vat } = req.body;
+                if (!expiry || !bodyItems || bodyItems.length === 0) {
+                    return res.status(400).json({ success: false, message: 'Missing required quote fields' });
+                }
+                if (booking.date && expiry >= booking.date) {
+                    return res.status(400).json({ success: false, message: `Quote expiry date must be before the event date (${booking.date}).` });
+                }
+                if (expiry < new Date().toISOString().split('T')[0]) {
+                    return res.status(400).json({ success: false, message: 'Quote expiry date cannot be in the past.' });
+                }
+                const minExpiry = new Date();
+                minExpiry.setDate(minExpiry.getDate() + 3);
+                if (expiry < minExpiry.toISOString().split('T')[0]) {
+                    return res.status(400).json({ success: false, message: 'Quote expiry must be at least 3 days from today to give the client adequate time to respond.' });
+                }
+                
+                bodyItems.forEach(i => {
+                    i.quantity_minutes = parseFloat(i.quantity_minutes) || parseFloat(i.quantity) || 1; // normalization
+                });
+
+                // Rate-card pricing check (lib/service-pricing.js). A line for a range / "from" / enquiry
+                // service has no catalogue amount, so it MUST carry an explicit agreed price — the quote is
+                // never allowed to go out with a R0 line or a guessed minimum / maximum / midpoint. Lines
+                // priced outside the published band only produce a warning: a tailored quote may differ.
+                const quoteServiceIds = [...new Set(bodyItems.map(i => parseInt(i.service_id)).filter(n => !isNaN(n)))];
+                if (quoteServiceIds.length) {
+                    const quoteServices = await new Promise(resolve => {
+                        db.all(`SELECT id, name, pricing_model, price_type, price_min, price_max, price_unit FROM services WHERE id IN (${quoteServiceIds.map(() => '?').join(',')})`,
+                            quoteServiceIds, (err, rows) => resolve(rows || []));
+                    });
+                    const lineCheck = checkQuoteLinePricing(bodyItems, quoteServices);
+                    if (lineCheck.error) return res.status(400).json({ success: false, message: lineCheck.error });
+                    priceWarnings = lineCheck.warnings;
+                    const quotedSvcById = new Map(quoteServices.map(s => [s.id, s]));
+                    individuallyQuoted = bodyItems.some(i => { const s = quotedSvcById.get(parseInt(i.service_id)); return !!s && needsIndividualQuote(s); });
+                }
+
+                // Conflict check
+                if (!req.body.override_conflict && booking.date) {
+                    const serviceIds = bodyItems.filter(i => i.service_id).map(i => i.service_id);
+                    if (serviceIds.length) {
+                        const dbServices = await new Promise((resolve) => {
+                            db.all(`SELECT * FROM services WHERE id IN (${serviceIds.map(() => '?').join(',')})`, serviceIds, (err, rows) => resolve(rows || []));
+                        });
+                        
+                        const maxServiceMins = dbServices.reduce((max, srv) => {
+                            const rowInput = bodyItems.find(s => s.service_id == srv.id);
+                            const isDurationBased = srv.pricing_model === 'per_minute' || srv.pricing_model === 'per_hour';
+                            const qtyMins = rowInput ? (parseFloat(rowInput.quantity_minutes) || parseFloat(rowInput.quantity) || 0) : 0;
+                            const length = isDurationBased && qtyMins > 0 ? qtyMins : (parseInt(srv.performance_length_minutes) || 0);
+                            const total = length + (parseInt(srv.setup_time_minutes) || 0);
+                            return Math.max(max, total);
+                        }, 0);
+                        
+                        const durationMins = maxServiceMins > 0 ? maxServiceMins : 120;
+                        const event_start_time = booking.event_start_time || '18:00';
+                        const startTime = moment(`${booking.date} ${event_start_time}`).toISOString();
+                        const endTime   = moment(startTime).add(durationMins, 'minutes').toISOString();
+                        
+                        // 1. Calendar conflict check
+                        const isBusy = await hasCalendarConflict(startTime, endTime, bookingId);
+                        if (isBusy) {
+                            return res.status(409).json({
+                                success: false,
+                                conflict: true,
+                                message: "Scheduling Conflict Detected: CulChar is busy or holds exist during this slot. Do you want to override and send this quote anyway?"
+                            });
+                        }
+                        
+                        // 2. per_day availability rule check
+                        const hasPerDayService = dbServices.some(s => s.availability_rule === 'per_day');
+                        if (hasPerDayService) {
+                            const conflictingBooking = await new Promise((resolve) => {
+                                db.get(`
+                                    SELECT b.id, b.event_name, s.name AS service_name
+                                    FROM booking_services bs
+                                    JOIN services s ON bs.service_id = s.id
+                                    JOIN bookings b ON bs.booking_id = b.id
+                                    WHERE b.date = ? 
+                                      AND b.id != ? 
+                                      AND b.status NOT IN ('CANCELLED', 'EXPIRED')
+                                      AND s.availability_rule = 'per_day'
+                                    LIMIT 1
+                                `, [booking.date, bookingId], (err, row) => resolve(row));
+                            });
+                            if (conflictingBooking) {
+                                return res.status(409).json({
+                                    success: false,
+                                    conflict: true,
+                                    message: `Scheduling Conflict Detected: "${conflictingBooking.service_name}" is already booked on this day (Booking #${conflictingBooking.id}: "${conflictingBooking.event_name}"). Do you want to override and send this quote anyway?`
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // FIN-2: tag each line's tax_class from the services catalog, then compute totals with
+                // the shared helper so VAT is charged only on taxable lines and the quote total, the
+                // stored invoice, and the PDF all agree.
+                await resolveLineTaxClasses(bodyItems);
+                let dp = parseFloat(discount) || 0;
+                const vatRate = await getVatRate();
+                const totals = computeDocumentTotals(bodyItems, { discount: dp, applyVat: !!apply_vat, vatRate });
+                let subtotal = totals.subtotal;
+                let vat = totals.vat;
+                finalTotal = totals.total;
+                items = bodyItems;
+
+                quote_amount = finalTotal.toFixed(2);
+                // vat_rate: the rate this quotation was issued at. The invoice and the contract reproduce THIS rate (lib/approved-quote.js),
+                // so a later change to the national rate cannot move an amount the client approved.
+                quote_details = JSON.stringify({ terms, items, discount: dp, apply_vat, finalTotal, subtotal, vat, vat_rate: vatRate });
+                quote_expiry_date = expiry;
+                booking.discount = dp;
+                booking.vat_rate = vatRate; // FIN-1/2: quote PDF uses the same rate as the calc
+                booking.terms = terms;
+            } else {
+                // Unstructured fallback (legacy) — normalize to plain numeric string
+                quote_amount = parseFloat((req.body.quote_amount || '0').replace(/[^0-9.]/g, '')).toFixed(2);
+                quote_details = req.body.quote_details;
+                quote_expiry_date = req.body.quote_expiry_date;
+                finalTotal = parseFloat((quote_amount || '0').replace(/[^0-9.]/g, '')) || 0;
+                items = [{ description: quote_details || 'Booking Service', quantity_minutes: 0, unit_price: finalTotal }];
+                
+                if (!quote_amount || !quote_details || !quote_expiry_date) {
+                    return res.status(400).json({ success: false, message: 'Missing required quote fields' });
+                }
+            }
+
+            const currentStatus = (booking.status || '').toUpperCase();
+            // Gap 3 (Phase 2): re-quoting a booking the client has already committed to returns it to
+            // QUOTED, supersedes its unpaid milestones and voids its live invoice, so the client must
+            // consent to the new total. Paid milestones and any PAID invoice survive — that money moved.
+            //
+            // "Committed" means ACCEPTED *or* CONFIRMED. A deposit confirms a booking, and CONFIRMED
+            // used to be excluded here: total_amount silently moved to the new figure while the invoice
+            // and the payment plan still described the old one, and the client could not re-accept
+            // (accept-quote requires QUOTED), so the booking was stranded mid-negotiation.
+            //
+            // The writes this implies live INSIDE the transaction below — they used to run here, before
+            // it opened, fire-and-forget with no error callback, so a rolled-back quote left the booking
+            // committed with its schedules superseded and its invoice VOID.
+            const reQuotingCommitted = currentStatus === 'ACCEPTED' || currentStatus === 'CONFIRMED';
+            let nextStatus = ['NEW', 'PENDING', 'REVIEWED', 'ACCEPTED', 'CONFIRMED'].includes(currentStatus) ? 'QUOTED' : currentStatus;
+
+            // Ensure directory exists
+            const quotesDir = docsWriteDir('quotes');
+
+            // Allocate the quote number the same way generateInvoice() allocates an invoice number.
+            // `quotations.quote_number` is UNIQUE and the timestamp only resolves to the second, so two
+            // quotes for one booking inside the same second — a double-click on Generate Quote — used to
+            // collide and roll the second one back with a 500. A revision suffix disambiguates them, and
+            // an archived quote keeps its number.
+            //   first:  QT-44-260710143012
+            //   again:  QT-44-260710143012-R2, -R3, …
+            const baseQuoteNumber = `QT-${bookingId}-${moment().format('YYMMDDHHmmss')}`;
+            const priorQuotes = await getQuoteNumberCollisionCount(baseQuoteNumber, `${baseQuoteNumber}-R%`);
+            const quoteNumber = priorQuotes === 0 ? baseQuoteNumber : `${baseQuoteNumber}-R${priorQuotes + 1}`;
+
+            // Generate PDF
+            const pdfFileName = `${quoteNumber}.pdf`;
+            const pdfPath = path.join(quotesDir, pdfFileName);
+
+            // Pass apply_vat to booking object for pdfService
+            booking.apply_vat = req.body.apply_vat;
+
+            // The rate card's pricing conditions travel with the quotation (prices are never public; the quotation is
+            // where a client first sees one). One set of lines feeds the PDF and the email so they cannot disagree.
+            const pricingConditions = await getQuotationConditions({
+                applyVat: !!booking.apply_vat,
+                vatRate: booking.vat_rate != null ? booking.vat_rate : await getVatRate(),
+                individuallyQuoted
+            });
+
+            try {
+                // quoteNumber is passed through so the number on the client's PDF is the number stored in
+                // `quotations.quote_number`, as invoices now do.
+                // quoteExpiry: the document says "valid until" the expiry chosen for THIS quote (the date the tracker enforces).
+                const pdfResult = await pdfService.generateDocument('Quote', booking, items, pdfPath, [], quoteNumber, { pricingConditions, quoteExpiry: quote_expiry_date, issuer });
+                await objectStorage.syncFileToStorage(pdfPath);
+
+                // Archive the old quotation, restamp the booking, insert the new versioned quotation
+                // and rebuild its line-item snapshot — one atomic unit, queued behind every other
+                // guarded transaction on the shared connection.
+                //
+                // The two DELETEs below previously ran with their error callbacks issuing a ROLLBACK
+                // and a 500 while the insertNext() chain carried on regardless, so a failed clear
+                // could produce a second response on the same request.
+                const quoteResult = await withDbTransaction(async () => {
+                    try {
+                        await dbRun("BEGIN IMMEDIATE");
+                    } catch (beginErr) {
+                        console.error('[Quote] BEGIN IMMEDIATE failed:', beginErr.message);
+                        return { status: 500, body: { success: false, message: 'Database busy. Please retry.' } };
+                    }
+                    try {
+                        // Re-quoting an ACCEPTED booking: supersede its stale schedules and void its
+                        // live invoice, atomically with the new quote. If the quote fails, none of
+                        // this happens and the booking keeps the plan the client already accepted.
+                        if (reQuotingCommitted) {
+                            await supersedePaymentSchedulesForRequote(bookingId);
+                            await voidInvoiceForRequote(bookingId);
+                            // A contract embodies the amount the client accepted; a re-quote changes that
+                            // amount, so any existing contract — draft, sent, or even signed/frozen — is
+                            // superseded and reset to draft. This clears the client's signature and the
+                            // freeze so a fresh contract must be generated and re-signed at the new figure,
+                            // preventing an old-amount (possibly already-signed) contract from surviving a
+                            // re-quote. A SUPERSEDED_BY_REQUOTE audit row records the invalidation.
+                            const supersededContract = await dbGet("SELECT status, is_frozen, contract_amount FROM contracts WHERE booking_id = ?", [bookingId]);
+                            await dbRun(
+                                `UPDATE contracts SET status = 'draft', is_frozen = 0,
+                                        sent_to_client_at = NULL, signed_by_client_at = NULL, signed_by_comedian_at = NULL,
+                                        client_signature_data = NULL, client_ip_address = NULL, signed_by = NULL, signed_date = NULL,
+                                        content_hash = NULL, updated_at = CURRENT_TIMESTAMP
+                                 WHERE booking_id = ?`,
+                                [bookingId]);
+                            if (supersededContract) {
+                                await dbRun(`INSERT INTO audit_log (table_name, record_id, action, new_values, changed_by, change_timestamp)
+                                        VALUES ('contracts', ?, 'SUPERSEDED_BY_REQUOTE', ?, ?, CURRENT_TIMESTAMP)`,
+                                    [bookingId, JSON.stringify({ previous_status: supersededContract.status, was_frozen: supersededContract.is_frozen === 1, previous_amount: supersededContract.contract_amount }), req.session.adminId || 'admin']);
+                            }
+                            await dbRun(`INSERT INTO audit_log (table_name, record_id, action, new_values, changed_by, change_timestamp)
+                                    VALUES ('bookings', ?, 'REQUOTE_AFTER_ACCEPTED', ?, ?, CURRENT_TIMESTAMP)`,
+                                [bookingId, JSON.stringify({ previous_status: currentStatus, new_status: 'QUOTED' }), req.session.adminId || 'admin']);
+                        }
+
+                        // Archive all previous active quotations for this booking
+                        await archivePreviousQuotations(bookingId);
+
+                        // 1. Update Booking.
+                        // quote_amount is kept on bookings for backward-compat (legacy email templates + admin UI
+                        // fallback). The bookings SELECT query prefers quotations.total_amount when a quotations
+                        // row exists. We also update quote_details JSON for fallback/caching on details/invoice generation.
+                        const currentPaid = parseFloat(booking.amount_paid) || 0;
+                        const newOutstanding = Math.max(0, finalTotal - currentPaid);
+                        await updateBookingAfterQuote(quote_amount, quote_details, quote_expiry_date, nextStatus, finalTotal, newOutstanding, bookingId);
+
+                        // 2. Next version
+                        const vRow = await getNextQuoteVersion(bookingId);
+                        const nextVersion = vRow ? vRow.next_version : 1;
+
+                        // 3. Insert new versioned Quotation
+                        const qIns = await insertQuotation(bookingId, quoteNumber, booking.client_id, quote_expiry_date, finalTotal, pdfFileName, nextVersion);
+                        const quotationId = qIns.lastID;
+                        await dbRun('UPDATE quotations SET issuer_snapshot = ? WHERE id = ?', [businessProfile.snapshotOf(issuer), quotationId]);
+
+                        // 4. Refresh line items (current snapshot)
+                        await deleteBookingLineItems(bookingId);
+                        await deleteBookingServices(bookingId);
+
+                        for (const it of items) {
+                            const q = parseFloat(it.quantity_minutes) || parseFloat(it.quantity) || 0;
+                            const p = parseFloat(it.unit_price) || 0;
+                            const desc = it.description || it.service_name || 'Service';
+                            await insertBookingLineItem(bookingId, it.service_id || null, desc, q || 1, p);
+                            if (it.service_id) {
+                                await insertBookingService(bookingId, it.service_id, q, p, q * p);
+                            }
+                            await insertQuoteLineItem(quotationId, it.service_id || null, desc, q, p);
+                        }
+
+                        // P3-3: Audit log for quote generation — inside the transaction, so a rollback
+                        // never leaves a log entry for a quote that was not issued.
+                        await dbRun(`INSERT INTO audit_log (table_name, record_id, action, new_values, changed_by, change_timestamp)
+                                     VALUES ('quotations', ?, 'QUOTE_GENERATED', ?, ?, CURRENT_TIMESTAMP)`,
+                            [bookingId, JSON.stringify({ version: nextVersion, amount: finalTotal, expiry: quote_expiry_date }), req.session.adminId || 'admin']);
+
+                        await dbRun("COMMIT");
+                        return { ok: true, nextVersion, quotationId };
+                    } catch (txErr) {
+                        await dbRun("ROLLBACK").catch(() => {});
+                        console.error("[Quote] Generation failed — rolled back, quote not issued:", txErr.message);
+                        // The structured branch takes items[].service_id on trust, and
+                        // booking_services.service_id carries a foreign key. An unknown id therefore
+                        // aborts the insert; that is the admin's mistake, not a server fault.
+                        if (/SQLITE_CONSTRAINT/i.test(txErr.message || '') && /FOREIGN KEY/i.test(txErr.message || '')) {
+                            return { status: 400, body: { success: false, message: 'One or more selected services no longer exist. Refresh the service list and rebuild the quote.' } };
+                        }
+                        return { status: 500, body: { success: false, message: 'Database error: ' + txErr.message } };
+                    }
+                });
+
+                if (!quoteResult.ok) return res.status(quoteResult.status).json(quoteResult.body);
+                const nextVersion = quoteResult.nextVersion;
+
+                // ---- Side effects, after the commit ----
+                syncBookingToCalendar(booking).catch(e => console.error('[Quote] Calendar sync failed:', e.message));
+                sendQuoteEmail(booking, quote_amount, pdfPath, pdfFileName, items, { pricingConditions }).catch(e => console.error("Quote email error:", e));
+                sendAdminQuoteSentNotification(booking, quote_amount).catch(e => console.error('[Quote] Admin notif failed:', e.message));
+                // A quote answers a waiting request and any revision request (Notification Centre)
+                require('../../lib/notify').resolve('bookings.request_received', booking.id, { req, note: 'A quote was sent.' });
+                require('../../lib/notify').resolve('bookings.revision_requested', booking.id, { req, note: 'A revised quote was sent.' });
+
+                // Per-day availability warning (non-blocking for admins)
+                const perDaySvcIds = items.filter(i => i.service_id).map(i => i.service_id);
+                const sendResponse = (warnings) => {
+                    const all = [...priceWarnings, ...warnings];
+                    res.json({ success: true, message: 'Quote generated and sent.', status: nextStatus, pdfUrl: `/api/admin/bookings/${bookingId}/quote/${quoteResult.quotationId}/download`, version: nextVersion, warnings: all.length ? all : undefined });
+                };
+                if (perDaySvcIds.length && !req.body.override_conflict) {
+                    db.all(`SELECT name FROM services WHERE id IN (${perDaySvcIds.map(() => '?').join(',')}) AND availability_rule = 'per_day'`, perDaySvcIds, (_, perDayRows) => {
+                        sendResponse((perDayRows || []).map(s => `"${s.name}" is limited to one booking per day. Verify no date conflicts exist.`));
+                    });
+                } else {
+                    sendResponse([]);
+                }
+        } catch (pdfErr) {
+            console.error("PDF/Quote Error:", pdfErr);
+            res.status(500).json({ success: false, message: 'Failed to generate quote PDF.' });
+        }
+        } catch (topLevelError) {
+            console.error("Unhandled Top Level Error in Quote Generation:", topLevelError);
+            // Phase 5 housekeeping: __dirname here would resolve to routes/admin (this file's own
+            // location), not the project root as it did in app.js — PROJECT_ROOT preserves the
+            // original target path (<root>/scratch/quote-error-toplevel.log) exactly.
+            fs.writeFileSync(path.join(PROJECT_ROOT, 'scratch', 'quote-error-toplevel.log'), topLevelError.stack || topLevelError.message);
+            if (!res.headersSent) {
+                res.status(500).json({ success: false, message: 'Internal server error during quote generation: ' + topLevelError.message });
+            }
+        }
+    });
+});
+
+// --- Enhanced Bookings (with venue + invoice) ---
+router.get('/api/admin/bookings/full', requireAdmin, (req, res) => {
+    const { search, status, limit, offset } = req.query;
+    const params = [];
+    let whereClause = 'WHERE 1=1';
+    if (search) {
+        whereClause += ` AND (LOWER(COALESCE(c.full_name, b.name)) LIKE LOWER(?) OR LOWER(COALESCE(c.email, b.email)) LIKE LOWER(?) OR LOWER(b.event_name) LIKE LOWER(?))`;
+        const s = `%${search}%`;
+        params.push(s, s, s);
+    }
+    if (status && status !== 'ALL') {
+        whereClause += ' AND b.status = ?';
+        params.push(status);
+    }
+    const pageLimit = Math.min(parseInt(limit) || 500, 1000);
+    const pageOffset = parseInt(offset) || 0;
+    params.push(pageLimit, pageOffset);
+
+    db.all(`SELECT b.*,
+        COALESCE(b.name, c.full_name) AS name,
+        COALESCE(b.email, c.email) AS email,
+        COALESCE(b.cell, c.phone) AS cell,
+        COALESCE(b.company, c.company_name) AS company,
+        COALESCE(v.name, b.event_location) AS event_location,
+        COALESCE(v.address, b.venue_address) AS venue_address,
+        COALESCE(v.city, b.city) AS city,
+        COALESCE(v.country, b.country) AS country,
+        v.name AS venue_name,
+        v.city AS venue_city,
+        v.capacity AS venue_capacity,
+        v.contact_name AS venue_contact,
+        v.contact_phone AS venue_contact_phone,
+        v.green_room_notes AS venue_notes,
+        CASE WHEN lq.total_amount IS NOT NULL
+             THEN printf('%.2f', lq.total_amount)
+             ELSE b.quote_amount
+        END AS quote_amount,
+        ${QUOTE_STATE_SQL}
+        (SELECT status FROM invoices WHERE booking_id = b.id AND UPPER(status) != 'VOID'
+         ORDER BY created_at DESC LIMIT 1) AS invoice_status,
+        (SELECT invoice_number FROM invoices WHERE booking_id = b.id AND UPPER(status) != 'VOID'
+         ORDER BY created_at DESC LIMIT 1) AS invoice_number,
+        (SELECT id FROM invoices WHERE booking_id = b.id AND UPPER(status) != 'VOID'
+         ORDER BY created_at DESC LIMIT 1) AS invoice_id,
+        (SELECT sent_at FROM invoices WHERE booking_id = b.id AND UPPER(status) != 'VOID'
+         ORDER BY created_at DESC LIMIT 1) AS invoice_sent_at,
+        (SELECT due_date FROM invoices WHERE booking_id = b.id AND UPPER(status) != 'VOID'
+         ORDER BY created_at DESC LIMIT 1) AS invoice_due_date,
+        (SELECT id FROM bookings WHERE rebooked_from_id = b.id LIMIT 1) AS rebooked_as_id,
+        ct.status AS contract_status,
+        ct.is_frozen AS contract_is_frozen,
+        ct.pdf_url AS contract_pdf_url,
+        ct.sent_to_client_at AS contract_sent_at,
+        ct.signed_by_client_at AS contract_signed_by_client_at,
+        COALESCE(b.disposition, 'active') AS disposition
+      FROM bookings b
+      LEFT JOIN venues v ON b.venue_id = v.id
+      LEFT JOIN clients c ON b.client_id = c.id
+      LEFT JOIN quotations lq ON lq.id = (SELECT MAX(id) FROM quotations WHERE booking_id = b.id AND UPPER(status) != 'VOID')
+      LEFT JOIN contracts ct ON ct.booking_id = b.id
+      ${whereClause}
+      ORDER BY b.created_at DESC LIMIT ? OFFSET ?`, params, (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+    });
+});
+
+// --- Bookings ---
+
+// Admin: manually create a booking (bypasses public rate limiter + POPIA form)
+router.post('/api/admin/bookings', requireAdmin, requireRole(['administrator', 'manager']), async (req, res) => {
+    const { name, email, cell, company, event_date, event_start_time,
+            event_name, event_type, event_location, status, budget_range, message,
+            venue_place_id, city, venue_address, country, services, override_conflict,
+            override_duplicate, override_working_hours, popia_consent, source_inquiry_id,
+            // Optional, additive richer venue fields the shared Places result carries when the
+            // manual-booking venue search found a real Google place (2026-09-29 consolidation) —
+            // `venues` has had columns for these since its original schema; nothing needed them
+            // threaded through here before now.
+            venue_state, venue_postal_code, venue_latitude, venue_longitude } = req.body;
+
+    if (!name || !email || !cell || !event_date || !event_name || !event_type || !event_location || !message)
+        return res.status(400).json({ success: false, message: 'Missing required fields.' });
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(event_date))
+        return res.status(400).json({ success: false, message: 'Invalid event date format.' });
+
+    if ((status || '').toUpperCase() === 'CONFIRMED') {
+        return res.status(400).json({ success: false, message: 'Direct manual creation in CONFIRMED status is blocked. Bookings must start as PENDING, QUOTED, or NEW and require payment to be confirmed.' });
+    }
+
+    const validStatuses = ['NEW','PENDING','QUOTED'];
+    const bookingStatus = validStatuses.includes((status || '').toUpperCase()) ? status.toUpperCase() : 'NEW';
+
+    // Duplicate check: same email + same date with an already-active booking
+    const existingBooking = await new Promise(resolve =>
+        getActiveDuplicateBookingForEmailDate(email, event_date, (_, row) => resolve(row))
+    );
+    if (existingBooking && !override_duplicate) {
+        return res.status(409).json({
+            success: false,
+            duplicate: true,
+            existing_id: existingBooking.id,
+            message: `An active booking (#${existingBooking.id}) already exists for this client on this date. Do you want to override and create this booking anyway?`
+        });
+    }
+
+    // 1. SECURE SERVICE VALIDATION & SNAPSHOTTING
+    if (!services || !Array.isArray(services) || services.length === 0) {
+        return res.status(400).json({ success: false, message: 'At least one service must be selected.' });
+    }
+
+    const svcIds = services.map(s => parseInt(s.service_id)).filter(id => !isNaN(id));
+    if (svcIds.length === 0) {
+        return res.status(400).json({ success: false, message: 'Invalid services provided.' });
+    }
+
+    try {
+        const placeholders = svcIds.map(() => '?').join(',');
+        const query = `SELECT * FROM services WHERE id IN (${placeholders})`;
+        const dbServices = await new Promise((resolve, reject) => {
+            db.all(query, svcIds, (err, rows) => {
+                if (err) reject(err); else resolve(rows || []);
+            });
+        });
+
+        let selectedServices = [];
+        let calculatedBaseScope = 0;
+
+        for (const inputSvc of services) {
+            const srv = dbServices.find(s => s.id === parseInt(inputSvc.service_id));
+            if (!srv) {
+                return res.status(400).json({ success: false, message: `Service ID ${inputSvc.service_id} is invalid.` });
+            }
+
+            const model = srv.pricing_model || 'flat';
+            const isFlat = model === 'flat' || model === 'flat_fee';
+            const isPerMinute = model === 'per_minute';
+            const isPerHour = model === 'per_hour';
+            
+            const qtyMinutes = parseInt(inputSvc.quantity_minutes) || 1;
+            // Only a fixed catalogue price is snapshotted; range / from / enquire services carry no amount
+            // (0) until the quote gives them an explicit one.
+            const unitPrice = catalogueUnitPrice(srv);
+            let lineTotal = 0;
+            // The manual-booking form sends MINUTES for both per_minute and per_hour rows. What is STORED
+            // as the billable quantity must match every reader (public intake, Quote Builder prefill,
+            // PDFs, emails): minutes for per_minute, but whole HOURS for per_hour. Storing the raw minutes
+            // here made an hourly line read "60 hr × R2,500" — a 60x over-statement when it prefilled the quote.
+            let billableQty = qtyMinutes;
+
+            if (isFlat) {
+                lineTotal = unitPrice;
+            } else if (isPerMinute) {
+                lineTotal = unitPrice * qtyMinutes;
+            } else if (isPerHour) {
+                billableQty = Math.ceil(qtyMinutes / 60);
+                lineTotal = unitPrice * billableQty;
+            } else {
+                lineTotal = unitPrice * qtyMinutes;
+            }
+
+            calculatedBaseScope += lineTotal;
+            selectedServices.push({
+                service_id: srv.id,
+                name: srv.name,
+                quantity_minutes: isFlat ? 1 : billableQty,
+                unit_price: unitPrice,
+                total_price: lineTotal,
+                pricing_model: model
+            });
+        }
+
+        // Calculate event duration
+        const maxServiceMins = dbServices.reduce((max, srv) => {
+            const rowInput = services.find(s => s.service_id == srv.id);
+            const isDurationBased = srv.pricing_model === 'per_minute' || srv.pricing_model === 'per_hour';
+            const qtyMins = rowInput ? parseInt(rowInput.quantity_minutes) : 0;
+            const length = isDurationBased && qtyMins > 0 ? qtyMins : (parseInt(srv.performance_length_minutes) || 0);
+            const total = length + (parseInt(srv.setup_time_minutes) || 0);
+            return Math.max(max, total);
+        }, 0);
+        
+        const durationMins = maxServiceMins > 0 ? maxServiceMins : 120;
+        const startTime = moment(`${event_date} ${event_start_time || '18:00'}`).toISOString();
+        const endTime   = moment(startTime).add(durationMins, 'minutes').toISOString();
+        const perfEndTime = event_start_time ? addMinutesToTime(event_start_time, durationMins) : null;
+
+        // Working hours check
+        if (event_start_time && !override_working_hours) {
+            const endHHMM = addMinutesToTime(event_start_time, durationMins);
+            const wh = await isWithinWorkingHours(event_date, event_start_time, endHHMM);
+            if (!wh.allowed) {
+                return res.status(400).json({
+                    success: false,
+                    working_hours_violation: true,
+                    message: `${wh.reason} Do you want to override and create this booking anyway?`
+                });
+            }
+        }
+
+        // Conflict check
+        const isBusy = await hasCalendarConflict(startTime, endTime);
+        if (isBusy && !override_conflict) {
+            return res.status(409).json({
+                success: false,
+                conflict: true,
+                message: "Scheduling Conflict Detected: CulChar is busy or holds exist during this slot. Do you want to override and create this booking anyway?"
+            });
+        }
+
+        const clientId = await findOrCreateClient(name, email, cell, company, null);
+        const venueId = await findOrCreateVenueFromPlace({
+            name: event_location, address: venue_address || null, city: city || null, country: country || null, placeId: venue_place_id || null,
+            state: venue_state || null, postalCode: venue_postal_code || null, latitude: venue_latitude || null, longitude: venue_longitude || null
+        });
+
+        const outcome = await withDbTransaction(async () => {
+            try {
+                await dbRun("BEGIN IMMEDIATE");
+            } catch (beginErr) {
+                console.error('[Admin] BEGIN IMMEDIATE failed:', beginErr.message);
+                return { status: 500, body: { success: false, message: 'Database lock error: ' + beginErr.message } };
+            }
+
+            try {
+                // skipGoogle=true: the pre-lock check above already consulted Google free/busy.
+                // Repeating that network round-trip while holding the write lock would stall every
+                // other transaction for as long as Google takes to answer.
+                if (!override_conflict) {
+                    const lockedBusy = await hasCalendarConflict(startTime, endTime, null, true);
+                    if (lockedBusy) {
+                        await dbRun("ROLLBACK").catch(() => {});
+                        return {
+                            status: 409,
+                            body: {
+                                success: false,
+                                conflict: true,
+                                message: "Scheduling Conflict Detected: CulChar is busy or holds exist during this slot. Do you want to override and create this booking anyway?"
+                            }
+                        };
+                    }
+                }
+
+                if (!override_duplicate) {
+                    const lockedDuplicate = await getActiveDuplicateBookingForEmailDateAsync(email, event_date);
+                    if (lockedDuplicate) {
+                        await dbRun("ROLLBACK").catch(() => {});
+                        return {
+                            status: 409,
+                            body: {
+                                success: false,
+                                duplicate: true,
+                                existing_id: lockedDuplicate.id,
+                                message: `An active booking (#${lockedDuplicate.id}) already exists for this client on this date. Do you want to override and create this booking anyway?`
+                            }
+                        };
+                    }
+                }
+
+                const initialQuoteAmountStr = `R ${calculatedBaseScope.toFixed(2)}`;
+                const initialTotalAmount = calculatedBaseScope;
+                const paymentStatus = 'UNPAID';
+                const defaultQuoteExpiry = moment(event_date).subtract(14, 'days').format('YYYY-MM-DD');
+                const consentVal = popia_consent !== undefined ? (popia_consent ? 1 : 0) : 1;
+
+                const sourceInquiryId = source_inquiry_id ? parseInt(source_inquiry_id) : null;
+
+                const ins = await insertAdminBooking([
+                    name, company || null, email, cell, event_name, event_date,
+                    event_start_time || null, event_start_time || null,
+                    perfEndTime, String(durationMins),
+                    event_type, event_location,
+                    city || null, venue_place_id || null,
+                    budget_range || null, message, bookingStatus,
+                    consentVal, clientId, venueId,
+                    initialQuoteAmountStr, initialTotalAmount, initialTotalAmount, paymentStatus, defaultQuoteExpiry, CURRENT_POLICY_VERSION, 'admin',
+                    sourceInquiryId && !isNaN(sourceInquiryId) ? sourceInquiryId : null
+                ]);
+                const bookingId = ins.lastID;
+
+                if (sourceInquiryId && !isNaN(sourceInquiryId)) {
+                    await linkInquiryToBooking(bookingId, sourceInquiryId);
+                }
+
+                // The consent record, the services and the audit row are part of the booking, not an
+                // afterthought. These used to run AFTER `COMMIT` with their errors swallowed by a bare
+                // console.error, so a failed insert left a committed booking with no services — and the
+                // route still answered 200 success. They are now inside the transaction.
+                await dbRun(
+                    `INSERT INTO consent_audit (booking_id, ip_address, user_agent, policy_version, consent_source) VALUES (?, ?, ?, ?, 'admin_recorded')`,
+                    [bookingId, req.ip || null, req.headers['user-agent'] || null, CURRENT_POLICY_VERSION]
+                );
+
+                for (const srv of selectedServices) {
+                    await insertBookingService(bookingId, srv.service_id, srv.quantity_minutes, srv.unit_price, srv.total_price);
+                    await insertBookingLineItem(bookingId, srv.service_id, srv.name, srv.quantity_minutes, srv.unit_price);
+                }
+
+                await dbRun(
+                    `INSERT INTO audit_log (table_name, record_id, action, new_values, changed_by, ip_address)
+                     VALUES ('bookings', ?, 'CREATE', ?, ?, ?)`,
+                    [
+                        bookingId,
+                        JSON.stringify({
+                            name, email, cell, event_name, event_type, date: event_date, budget_range, status: bookingStatus, client_id: clientId, venue_id: venueId,
+                            overrides: {
+                                conflict: !!override_conflict,
+                                duplicate: !!override_duplicate,
+                                working_hours: !!override_working_hours
+                            }
+                        }),
+                        req.session.username || 'admin',
+                        req.ip || null
+                    ]
+                );
+
+                await dbRun("COMMIT");
+                return { ok: true, bookingId };
+            } catch (dbErr) {
+                await dbRun("ROLLBACK").catch(() => {});
+                console.error('[Admin] Manual booking insert failed — rolled back, no partial booking saved:', dbErr.message);
+                return { status: 500, body: { success: false, message: 'Database error: ' + dbErr.message } };
+            }
+        });
+
+        if (!outcome.ok) return res.status(outcome.status).json(outcome.body);
+        const bookingId = outcome.bookingId;
+
+        // Sync to Google Calendar (non-blocking, after commit)
+        syncBookingToCalendar(bookingId).catch(calErr => {
+            console.error(`[Admin] Google Calendar sync failed for booking #${bookingId}:`, calErr.message);
+        });
+
+        res.json({ success: true, booking_id: bookingId, message: 'Booking created.' });
+    } catch (err) {
+        console.error('[Admin] Manual booking error:', err);
+        return res.status(500).json({ success: false, message: 'Failed to create manual booking: ' + err.message });
+    }
+});
+
+router.get('/api/admin/bookings', requireAdmin, (req, res) => {
+    const {
+        status, paymentStatus, search,
+        dateFrom, dateTo,
+        sortBy = 'created_at', order = 'DESC',
+        limit = 100, offset = 0
+    } = req.query;
+
+    const conditions = [];
+    const params = [];
+
+    if (status) {
+        const statuses = status.split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+        if (statuses.length) {
+            conditions.push(`b.status IN (${statuses.map(() => '?').join(',')})`);
+            params.push(...statuses);
+        }
+    }
+    if (paymentStatus) {
+        const ps = paymentStatus.split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+        if (ps.length) {
+            conditions.push(`b.payment_status IN (${ps.map(() => '?').join(',')})`);
+            params.push(...ps);
+        }
+    }
+    if (dateFrom) { conditions.push('b.date >= ?'); params.push(dateFrom); }
+    if (dateTo)   { conditions.push('b.date <= ?'); params.push(dateTo); }
+    if (search) {
+        conditions.push(`(LOWER(COALESCE(c.full_name, b.name)) LIKE ? OR LOWER(COALESCE(c.email, b.email)) LIKE ? OR CAST(b.id AS TEXT) = ?)`);
+        const s = `%${search.toLowerCase()}%`;
+        params.push(s, s, search);
+    }
+
+    const allowedSort = ['created_at', 'date', 'total_amount', 'status', 'name'];
+    const safeSortBy = allowedSort.includes(sortBy) ? `b.${sortBy}` : 'b.created_at';
+    const safeOrder = order.toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
+    const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    const lim = Math.min(Math.max(parseInt(limit) || 100, 1), 500);
+    const off = Math.max(parseInt(offset) || 0, 0);
+
+    const countSql = `SELECT COUNT(*) as total FROM bookings b LEFT JOIN clients c ON b.client_id = c.id ${whereClause}`;
+    db.get(countSql, params, (cntErr, countRow) => {
+        if (cntErr) return res.status(500).json({ error: cntErr.message });
+        const total = countRow ? countRow.total : 0;
+
+        const dataSql = `SELECT b.*,
+            COALESCE(b.name, c.full_name) AS name,
+            COALESCE(b.email, c.email) AS email,
+            COALESCE(b.cell, c.phone) AS cell,
+            COALESCE(b.company, c.company_name) AS company,
+            COALESCE(v.name, b.event_location) AS event_location,
+            COALESCE(v.address, b.venue_address) AS venue_address,
+            COALESCE(v.city, b.city) AS city,
+            COALESCE(v.country, b.country) AS country,
+            CASE WHEN lq.total_amount IS NOT NULL
+                 THEN printf('%.2f', lq.total_amount)
+                 ELSE b.quote_amount
+            END AS quote_amount,
+            ${QUOTE_STATE_SQL}
+            v.green_room_notes,
+            v.notes AS venue_notes,
+            v.negotiated_rates AS venue_negotiated_rates,
+            lq.sent_at AS quote_sent_at,
+            li.id AS invoice_id,
+            li.sent_at AS invoice_sent_at,
+            li.status AS invoice_status,
+            li.due_date AS invoice_due_date,
+            ct.status AS contract_status,
+            ct.is_frozen AS contract_is_frozen,
+            ct.pdf_url AS contract_pdf_url,
+            ct.sent_to_client_at AS contract_sent_at,
+            ct.signed_by_client_at AS contract_signed_by_client_at
+          FROM bookings b
+          LEFT JOIN venues v ON b.venue_id = v.id
+          LEFT JOIN clients c ON b.client_id = c.id
+          LEFT JOIN quotations lq ON lq.id = (SELECT MAX(id) FROM quotations WHERE booking_id = b.id AND archived = 0)
+          LEFT JOIN invoices li ON li.id = (SELECT MAX(id) FROM invoices WHERE booking_id = b.id AND status NOT IN ('void','VOID'))
+          LEFT JOIN contracts ct ON ct.booking_id = b.id
+          ${whereClause}
+          ORDER BY ${safeSortBy} ${safeOrder}
+          LIMIT ? OFFSET ?`;
+
+        db.all(dataSql, [...params, lim, off], (err, rows) => {
+            if (err) return res.status(500).json({ error: err.message });
+            res.json({ bookings: rows, total, limit: lim, offset: off });
+        });
+    });
+});
+
+router.get('/api/admin/bookings/:id', requireAdmin, (req, res) => {
+    db.get(`SELECT b.*,
+        COALESCE(b.name, c.full_name) AS name,
+        COALESCE(b.email, c.email) AS email,
+        COALESCE(b.cell, c.phone) AS cell,
+        COALESCE(b.company, c.company_name) AS company,
+        COALESCE(v.name, b.event_location) AS event_location,
+        COALESCE(v.address, b.venue_address) AS venue_address,
+        COALESCE(v.city, b.city) AS city,
+        COALESCE(v.country, b.country) AS country,
+        CASE WHEN lq.total_amount IS NOT NULL
+             THEN printf('%.2f', lq.total_amount)
+             ELSE b.quote_amount
+        END AS quote_amount,
+        ${QUOTE_STATE_SQL}
+        v.green_room_notes,
+        v.notes AS venue_notes,
+        v.negotiated_rates AS venue_negotiated_rates,
+        cnl.refund_due,
+        cnl.retention_amount,
+        cnl.total_paid_to_date AS cancellation_paid_snapshot,
+        lq.sent_at AS quote_sent_at,
+        li.id AS invoice_id,
+        li.sent_at AS invoice_sent_at,
+        li.status AS invoice_status,
+        li.due_date AS invoice_due_date,
+        ct.status AS contract_status,
+        ct.is_frozen AS contract_is_frozen,
+        ct.pdf_url AS contract_pdf_url,
+        ct.sent_to_client_at AS contract_sent_at,
+        ct.signed_by_client_at AS contract_signed_by_client_at
+      FROM bookings b
+      LEFT JOIN venues v ON b.venue_id = v.id
+      LEFT JOIN clients c ON b.client_id = c.id
+      LEFT JOIN quotations lq ON lq.id = (SELECT MAX(id) FROM quotations WHERE booking_id = b.id AND archived = 0)
+      LEFT JOIN cancellations cnl ON cnl.booking_id = b.id
+      LEFT JOIN invoices li ON li.id = (SELECT MAX(id) FROM invoices WHERE booking_id = b.id AND status NOT IN ('void','VOID'))
+      LEFT JOIN contracts ct ON ct.booking_id = b.id
+      WHERE b.id = ?`, [req.params.id], (err, row) => {
+        if (err) return res.status(500).json({ error: err.message });
+        if (!row) return res.status(404).json({ error: "Booking not found" });
+
+        // `unit_price` is the booking's own snapshot (what was agreed or estimated when the line was added);
+        // the catalogue fields beside it describe how the service is priced TODAY so the Quote Builder and
+        // the booking screens can tell "no amount agreed yet" from a genuine R0 and never fall back to today's fee.
+        db.all(`SELECT s.id AS service_id, s.name AS service_name, s.pricing_model, s.default_price, s.base_price,
+                       s.price_type, s.price_min, s.price_max, s.price_unit, s.tax_class, s.display_unit,
+                       s.min_quantity, s.max_quantity, s.performance_length_minutes, s.external_note,
+                       bs.quantity_minutes, bs.unit_price,
+                       (bs.unit_price * bs.quantity_minutes) AS line_total
+                FROM booking_services bs
+                JOIN services s ON bs.service_id = s.id
+                WHERE bs.booking_id = ?
+                ORDER BY bs.id`, [req.params.id], (err2, services) => {
+            // service_name is the service's name TODAY; line_description is what the line was called when it was booked / quoted
+            // (the Quote Builder revises a quotation under the latter - lib/booking-lines.js).
+            db.all('SELECT service_id, description FROM booking_line_items WHERE booking_id = ? ORDER BY id', [req.params.id], (err3, storedLines) => {
+                row.services = withStoredDescriptions(services || [], err3 ? [] : storedLines).map(svc => ({
+                    ...svc,
+                    ...describePrice(svc),
+                    catalogue_unit_price: catalogueUnitPrice(svc),
+                    unpriced: needsIndividualQuote(svc) && !(parseFloat(svc.unit_price) > 0)
+                }));
+                res.json(row);
+            });
+        });
+    });
+});
+
+// Correct what the client gave us at booking time — name, email, cell, company, VAT number, billing address. These are the client's
+// OWN facts, not ours, so a typo or a changed number needs fixing here rather than on a fresh booking: a wrong cell number means a client
+// cannot be reached, a wrong email locks them out of their own tracking link, and a missing/garbled VAT number or address is exactly what
+// lib/business-profile-core.js's taxInvoiceAdvice() warns is needed before a qualifying tax invoice goes out.
+//
+// Partial update: only the fields present in the body are validated and changed. bookings.* stays the source of truth documents read
+// (same convention as everywhere else in this file — admin-typed text is stored as typed, not re-encoded); the linked client record is
+// then refreshed through the same findOrCreateClient() every other booking path uses, so a corrected e-mail re-resolves to the right
+// client (or creates one) instead of silently renaming someone else's.
+router.put('/api/admin/bookings/:id/contact', requireAdmin, requireRole(['administrator', 'manager']), async (req, res) => {
+    try {
+        const bookingId = parseInt(req.params.id, 10);
+        if (!Number.isInteger(bookingId)) return res.status(400).json({ success: false, message: 'Invalid booking id.' });
+        const existing = await dbGet('SELECT id, name, email, cell, company, vat_number, billing_address, client_id FROM bookings WHERE id = ?', [bookingId]);
+        if (!existing) return res.status(404).json({ success: false, message: 'Booking not found.' });
+
+        const body = req.body || {};
+        const FIELDS = ['name', 'email', 'cell', 'company', 'vat_number', 'billing_address'];
+        const present = FIELDS.filter((f) => Object.prototype.hasOwnProperty.call(body, f));
+        if (!present.length) return res.status(400).json({ success: false, message: 'Nothing to update.' });
+
+        const next = {};   // validated/normalised value for every PRESENT field only
+        const errors = {};
+        if (present.includes('name')) {
+            const v = asBookingText(body.name);
+            if (v.length < 2 || v.length > 150) errors.name = 'Name must be between 2 and 150 characters.';
+            else next.name = v;
+        }
+        if (present.includes('email')) {
+            const v = asBookingText(body.email).toLowerCase();
+            if (!PATTERNS.email.test(v) || v.length > 200) errors.email = 'Enter a valid email address.';
+            else next.email = v;
+        }
+        if (present.includes('cell')) {
+            const v = asBookingText(body.cell);
+            if (!PATTERNS.phone.test(v)) errors.cell = 'Enter a valid phone number.';
+            else next.cell = v;
+        }
+        if (present.includes('company')) {
+            const v = asBookingText(body.company);
+            if (v.length > 150) errors.company = 'Company name must be under 150 characters.';
+            else next.company = v || null;   // '' clears it — a client can stop being a company booking
+        }
+        if (present.includes('vat_number')) {
+            const cleanVat = normaliseClientVat(body.vat_number);
+            if (cleanVat === null) errors.vat_number = CLIENT_VAT_MESSAGE;
+            else next.vat_number = cleanVat || null;
+        }
+        if (present.includes('billing_address')) {
+            const v = asBookingText(body.billing_address);
+            if (v.length > 300) errors.billing_address = 'Billing address must be under 300 characters.';
+            else next.billing_address = v || null;
+        }
+        if (Object.keys(errors).length) return res.status(400).json({ success: false, message: 'Not saved: ' + Object.values(errors).join(' '), errors });
+
+        // The merged, effective state — what every field reads as once this save applies — used both for the UPDATE and for
+        // re-resolving the linked client record below.
+        const merged = Object.assign({}, existing, next);
+
+        const sets = Object.keys(next).map((f) => `${f} = ?`);
+        const params = Object.keys(next).map((f) => next[f]);
+        await dbRun(`UPDATE bookings SET ${sets.join(', ')} WHERE id = ?`, params.concat([bookingId]));
+
+        // The same identity resolution every booking path uses: finds the client row for this e-mail (or makes one) and mirrors
+        // name/company/VAT number onto it. A corrected e-mail therefore relinks the booking to the right client rather than
+        // renaming whoever currently holds the old e-mail.
+        let clientId = existing.client_id;
+        try {
+            clientId = await findOrCreateClient(merged.name, merged.email, merged.cell, merged.company, merged.vat_number);
+            if (clientId !== existing.client_id) await dbRun('UPDATE bookings SET client_id = ? WHERE id = ?', [clientId, bookingId]);
+            // billing_address and phone aren't part of findOrCreateClient's own contract (other callers don't supply them) — mirrored
+            // here directly so the client's own record stays in step for whichever OTHER booking reads it next.
+            await dbRun('UPDATE clients SET billing_address = COALESCE(?, billing_address), phone = ? WHERE id = ?', [merged.billing_address, merged.cell, clientId]);
+        } catch (e) {
+            console.error('[Booking Contact] Client record could not be refreshed for booking #' + bookingId + ':', e.message);
+            // The booking's own columns are already saved above — what documents and the admin screen read. The shared client
+            // record is a secondary, best-effort mirror; its failure is logged, not fatal to this save.
+        }
+
+        const diffOld = {}, diffNew = {};
+        for (const f of Object.keys(next)) {
+            const a = existing[f] == null ? '' : String(existing[f]);
+            const b = next[f] == null ? '' : String(next[f]);
+            if (a !== b) { diffOld[f] = a; diffNew[f] = b; }
+        }
+        if (Object.keys(diffNew).length) {
+            await dbRun(`INSERT INTO audit_log (table_name, record_id, action, old_values, new_values, changed_by, change_timestamp)
+                         VALUES ('bookings', ?, 'CONTACT_UPDATED', ?, ?, ?, CURRENT_TIMESTAMP)`,
+                [bookingId, JSON.stringify(diffOld), JSON.stringify(diffNew), req.session.adminId || 'admin']);
+            require('../../lib/notify').emit('customer.contact_changed', { bookingId: Number(bookingId), by: 'admin', actorLabel: req.session.username, fields: Object.keys(diffNew).join(', '), before: diffOld, after: diffNew }, { req });
+        }
+
+        res.json({ success: true, message: 'Contact details updated.', updated: Object.keys(next) });
+    } catch (e) {
+        console.error('[Booking Contact] Update failed for booking #' + req.params.id + ':', e.message);
+        res.status(500).json({ success: false, message: 'Could not save these changes. Please try again.' });
+    }
+});
+
+// Correct the EVENT's details - name, type, date and performance time - usually because the client asked (a "[Correction
+// Request]" note from the tracking drawer). Partial update: only the fields present are validated and changed. The date and
+// time go through lib/booking-reschedule.js, the same rules the calendar drag uses (conflict check, quote expiry, holds and
+// the linked event follow, audit row, calendar re-sync, the client e-mailed about a new date); if that refuses (a clash),
+// nothing else is saved either. Venue changes stay on the Venue card (PATCH :id/venue / PUT :id/venue-google).
+router.put('/api/admin/bookings/:id/event-details', requireAdmin, requireRole(['administrator', 'manager']), async (req, res) => {
+    try {
+        const bookingId = parseInt(req.params.id, 10);
+        if (!Number.isInteger(bookingId)) return res.status(400).json({ success: false, message: 'Invalid booking id.' });
+        const row = await dbGet('SELECT id, event_name, event_type, date, event_start_time, performance_end_time, performance_slot FROM bookings WHERE id = ?', [bookingId]);
+        if (!row) return res.status(404).json({ success: false, message: 'Booking not found.' });
+
+        const body = req.body || {};
+        const has = (f) => Object.prototype.hasOwnProperty.call(body, f);
+        const errors = [];
+        const named = {};
+        if (has('event_name')) {
+            const v = asBookingText(body.event_name);
+            if (v.length < 2 || v.length > 150) errors.push('Event name must be between 2 and 150 characters.');
+            else named.event_name = v;
+        }
+        if (has('event_type')) {
+            const v = asBookingText(body.event_type);
+            if (v.length < 2 || v.length > 80) errors.push('Event type must be between 2 and 80 characters.');
+            else named.event_type = v;
+        }
+        const date = has('date') ? asBookingText(body.date) : row.date;
+        if (has('date') && !(/^\d{4}-\d{2}-\d{2}$/.test(date) && moment(date, 'YYYY-MM-DD', true).isValid())) errors.push('Enter a valid date.');
+        const start = has('start_time') ? asBookingText(body.start_time) : undefined;
+        const end = has('end_time') ? asBookingText(body.end_time) : undefined;
+        if (start !== undefined && start !== '' && !/^\d{2}:\d{2}$/.test(start)) errors.push('Start time must be HH:MM.');
+        if (end !== undefined && end !== '' && !/^\d{2}:\d{2}$/.test(end)) errors.push('End time must be HH:MM.');
+        if (end && !(start || row.event_start_time)) errors.push('Give a start time with the end time.');
+        if (errors.length) return res.status(400).json({ success: false, message: 'Not saved: ' + errors.join(' ') });
+
+        const updated = [];
+        const timeChanged = (start !== undefined && start !== (row.event_start_time || '')) || (end !== undefined && end !== (row.performance_end_time || ''));
+        if (date !== row.date || timeChanged) {
+            const out = await rescheduleBooking({
+                bookingId, date,
+                time: start !== undefined && start !== (row.event_start_time || '') ? start : undefined,
+                endTime: end !== undefined && end !== (row.performance_end_time || '') ? end : undefined,
+                actorId: req.session && req.session.adminId,
+                notifyWhenDateUnchanged: false   // e-mail the client about a new DATE, not about a time-only fix
+            });
+            if (!out.ok) return res.status(out.status).json({ success: false, message: out.message });
+            if (date !== row.date) updated.push('date');
+            if (timeChanged) {
+                updated.push('time');
+                // Keep the human-readable slot ("09:00–10:00", the public form's own format) in step with the times.
+                const fresh = await dbGet('SELECT event_start_time, performance_end_time FROM bookings WHERE id = ?', [bookingId]);
+                const slot = fresh.event_start_time ? fresh.event_start_time + (fresh.performance_end_time ? '–' + fresh.performance_end_time : '') : null;
+                await dbRun('UPDATE bookings SET performance_slot = ? WHERE id = ?', [slot, bookingId]);
+            }
+        }
+
+        const nameChanges = Object.keys(named).filter((f) => (row[f] || '') !== named[f]);
+        if (nameChanges.length) {
+            await dbRun(`UPDATE bookings SET ${nameChanges.map((f) => f + ' = ?').join(', ')}, modified_on = CURRENT_TIMESTAMP WHERE id = ?`,
+                nameChanges.map((f) => named[f]).concat([bookingId]));
+            const oldValues = {}, newValues = {};
+            nameChanges.forEach((f) => { oldValues[f] = row[f] || ''; newValues[f] = named[f]; });
+            await dbRun(`INSERT INTO audit_log (table_name, record_id, action, old_values, new_values, changed_by, change_timestamp)
+                         VALUES ('bookings', ?, 'EVENT_UPDATED', ?, ?, ?, CURRENT_TIMESTAMP)`,
+                [bookingId, JSON.stringify(oldValues), JSON.stringify(newValues), (req.session && req.session.adminId) || 'admin']);
+            getBookingById(bookingId, (e, fresh) => {
+                if (!e && fresh) syncBookingToCalendar(fresh).catch((ce) => console.error('[Event Details] Calendar sync failed:', ce.message));
+            });
+            updated.push(...nameChanges);
+        }
+
+        res.json({ success: true, message: updated.length ? 'Event details updated.' : 'Nothing changed.', updated });
+    } catch (e) {
+        console.error('[Event Details] Update failed for booking #' + req.params.id + ':', e.message);
+        res.status(500).json({ success: false, message: 'Could not save these changes. Please try again.' });
+    }
+});
+
+// Shared status-change logic used by both PUT /bookings/:id and PUT /bookings/:id/status
+// options.reason — optional cancellation reason string (admin-supplied)
+// Phase 5 (HOUSEKEEPING-NOTES.md): applyStatusChange moved to lib/booking-status.js — see the
+// require near the top of this file for the re-import.
+
+router.put('/api/admin/bookings/:id', requireAdmin, (req, res) => {
+    const { status, reason } = req.body;
+    if (!status) return res.status(400).json({ success: false, message: 'status field required.' });
+    getBookingStatus(req.params.id, (err, row) => {
+        if (err || !row) return res.status(404).json({ success: false, message: 'Booking not found.' });
+        applyStatusChange(req.params.id, status.toUpperCase(), (row.status || '').toUpperCase(), res, { reason, adminId: req.session.adminId, role: req.session.role });
+    });
+});
+
+router.patch('/api/admin/bookings/:id/buffer', requireAdmin, (req, res) => {
+    const id = parseInt(req.params.id);
+    const raw = req.body.buffer_minutes;
+    const mins = (raw === null || raw === '') ? null : parseInt(raw);
+    if (mins !== null && (isNaN(mins) || mins < 0 || mins > 480)) {
+        return res.status(400).json({ success: false, message: 'Buffer must be 0–480 minutes or null.' });
+    }
+    updateBookingBuffer(mins, id, function(err) {
+        if (err) return res.status(500).json({ success: false, error: err.message });
+        if (this.changes === 0) return res.status(404).json({ success: false, message: 'Booking not found.' });
+        res.json({ success: true, buffer_minutes: mins });
+    });
+});
+
+// Update booking public promotion status
+router.put('/api/admin/bookings/:id/public', requireAdmin, (req, res) => {
+    const { is_public, ticket_link } = req.body;
+
+    // Validate ticket_link if provided
+    if (ticket_link && ticket_link.trim() !== '') {
+        try { new URL(ticket_link.trim()); } catch(e) {
+            return res.status(400).json({ success: false, message: 'Invalid ticket URL. Please include https://...' });
+        }
+    }
+
+    const cleanLink = (ticket_link && ticket_link.trim() !== '') ? ticket_link.trim() : null;
+    const bookingId = req.params.id;
+
+    db.get(
+        `SELECT b.*, v.name AS venue_name 
+         FROM bookings b 
+         LEFT JOIN venues v ON b.venue_id = v.id 
+         WHERE b.id = ?`,
+        [bookingId],
+        (err, booking) => {
+            if (err) return res.status(500).json({ success: false, message: err.message });
+            if (!booking) return res.status(404).json({ success: false, message: 'Booking not found.' });
+
+            const isPromote = is_public ? 1 : 0;
+
+            if (isPromote) {
+                // Toggling ON
+                const eventTime = booking.event_start_time || '19:00:00';
+                const formattedTime = eventTime.includes(':') ? (eventTime.split(':').length === 2 ? `${eventTime}:00` : eventTime) : `${eventTime}:00:00`;
+                const eventDatetime = `${booking.date}T${formattedTime}`;
+                const venueName = booking.venue_name || booking.event_location || 'TBA';
+                const eventTitle = booking.event_name || booking.event_type || 'Comedy Show';
+                const eventDesc = booking.admin_notes || booking.notes || 'Public show';
+                const ip_address = req.ip || req.connection.remoteAddress || 'unknown';
+                const user_agent = req.get('User-Agent') || 'unknown';
+
+                const mapLink = (booking.event_location || booking.venue_address)
+                    ? `https://maps.google.com/?q=${encodeURIComponent((booking.event_location || '') + ' ' + (booking.venue_address || ''))}`
+                    : null;
+
+                const performInsert = () => {
+                    insertPublicEvent(
+                        eventTitle, eventDesc, eventDatetime,
+                        venueName, booking.venue_id || null, mapLink, cleanLink,
+                        bookingId, req.session.adminId, ip_address, user_agent,
+                        function(insertErr) {
+                            if (insertErr) return res.status(500).json({ success: false, message: insertErr.message });
+                            const newEventId = this.lastID;
+
+                            setBookingPublicWithNewEvent(
+                                cleanLink, newEventId, bookingId,
+                                function(updateErr) {
+                                    if (updateErr) return res.status(500).json({ success: false, message: updateErr.message });
+                                    sendResponse();
+                                }
+                            );
+                        }
+                    );
+                };
+
+                if (booking.event_id) {
+                    checkEventExistsById(booking.event_id, (checkErr, eventRow) => {
+                        if (checkErr) return res.status(500).json({ success: false, message: checkErr.message });
+                        if (eventRow) {
+                            updatePublicEvent(
+                                eventTitle, eventDesc, eventDatetime,
+                                venueName, booking.venue_id || null, mapLink, cleanLink,
+                                req.session.adminId, ip_address, user_agent,
+                                booking.event_id,
+                                function(updateEventErr) {
+                                    if (updateEventErr) return res.status(500).json({ success: false, message: updateEventErr.message });
+                                    
+                                    setBookingPublicTicketLink(
+                                        cleanLink, bookingId,
+                                        function(updateErr) {
+                                            if (updateErr) return res.status(500).json({ success: false, message: updateErr.message });
+                                            sendResponse();
+                                        }
+                                    );
+                                }
+                            );
+                        } else {
+                            performInsert();
+                        }
+                    });
+                } else {
+                    performInsert();
+                }
+            } else {
+                // Toggling OFF
+                if (booking.event_id) {
+                    clearBookingPublicWithEvent(
+                        bookingId,
+                        function(updateErr) {
+                            if (updateErr) return res.status(500).json({ success: false, message: updateErr.message });
+                            
+                            deleteEventById(booking.event_id, function(deleteErr) {
+                                if (deleteErr) return res.status(500).json({ success: false, message: deleteErr.message });
+                                sendResponse();
+                            });
+                        }
+                    );
+                } else {
+                    clearBookingPublicTicketLink(
+                        bookingId,
+                        function(updateErr) {
+                            if (updateErr) return res.status(500).json({ success: false, message: updateErr.message });
+                            sendResponse();
+                        }
+                    );
+                }
+            }
+
+            function sendResponse() {
+                db.get(`SELECT b.event_name, b.event_type, b.date, b.event_start_time, b.event_location,
+                               COALESCE(v.name, b.event_location) AS venue_display, b.is_public, b.ticket_link, b.event_id
+                        FROM bookings b LEFT JOIN venues v ON b.venue_id = v.id WHERE b.id = ?`, [bookingId], (e, row) => {
+                    res.json({ success: true, message: 'Promotion status updated.', preview: row || null });
+                });
+            }
+        }
+    );
+});
+
+router.put('/api/admin/bookings/:id/status', requireAdmin, (req, res) => {
+    const requestedStatus = (req.body.status || '').toUpperCase();
+    const reason = req.body.reason;
+    if (!requestedStatus) return res.status(400).json({ success: false, message: 'status field required.' });
+    getBookingStatus(req.params.id, (err, row) => {
+        if (err || !row) return res.status(404).json({ success: false, message: 'Booking not found' });
+        applyStatusChange(req.params.id, requestedStatus, (row.status || '').toUpperCase(), res, { reason, adminId: req.session.adminId, role: req.session.role });
+    });
+});
+
+// Phase 5 (HOUSEKEEPING-NOTES.md): BOOKING_DISPOSITIONS moved into routes/admin/bookings.js as a
+// single-consumer local alongside the disposition route.
+router.put('/api/admin/bookings/:id/disposition', requireAdmin, (req, res) => {
+    const bookingId = req.params.id;
+    const disposition = req.body.disposition;
+    if (!BOOKING_DISPOSITIONS.includes(disposition)) {
+        return res.status(400).json({ success: false, message: `disposition must be one of: ${BOOKING_DISPOSITIONS.join(', ')}` });
+    }
+    getBookingDisposition(bookingId, (err, row) => {
+        if (err) return res.status(500).json({ success: false, message: err.message });
+        if (!row) return res.status(404).json({ success: false, message: 'Booking not found' });
+        const previous = row.disposition || 'active';
+        updateBookingDisposition(disposition, bookingId, function(upErr) {
+            if (upErr) return res.status(500).json({ success: false, message: upErr.message });
+            db.run(`INSERT INTO audit_log (table_name, record_id, action, old_values, new_values, changed_by, change_timestamp)
+                    VALUES ('bookings', ?, 'DISPOSITION', ?, ?, ?, CURRENT_TIMESTAMP)`,
+                [bookingId, JSON.stringify({ disposition: previous }), JSON.stringify({ disposition }), req.session.adminId || 'admin'],
+                (aErr) => { if (aErr) console.error('[Audit] Disposition change log failed:', aErr.message); });
+            res.json({ success: true, disposition });
+        });
+    });
+});
+
+// ==========================================
+// Financial & Invoicing Routes
+// ==========================================
+
+// 1. Generate Invoice from Booking (Admin)
+router.post('/api/admin/bookings/:id/invoice/generate', requireAdmin, requireRole(['administrator', 'manager']), async (req, res) => {
+    const bookingId = req.params.id;
+    // Guard: if a quotation exists for this booking it must be in 'accepted' state
+    const activeQuote = await getActiveQuoteStatusForInvoiceGuard(bookingId).catch(() => null);
+
+    if (activeQuote && activeQuote.status !== 'accepted') {
+        return res.status(400).json({
+            success: false,
+            message: `Invoice cannot be generated: the active quote is in '${activeQuote.status}' status. The client must accept the quote first.`
+        });
+    }
+
+    try {
+        const result = await generateInvoice(bookingId);
+        // P3-3: Audit log for invoice generation
+        if (result && result.success) {
+            db.run(`INSERT INTO audit_log (table_name, record_id, action, new_values, changed_by, change_timestamp)
+                    VALUES ('invoices', ?, 'INVOICE_GENERATED', ?, ?, CURRENT_TIMESTAMP)`,
+                [bookingId, JSON.stringify({ invoice_id: result.invoice_id }), req.session.adminId || 'admin'],
+                (aErr) => { if (aErr) console.error('[Audit] Invoice generation log failed:', aErr.message); });
+        }
+        res.json(result);
+    } catch (err) {
+        console.error("Admin Invoice Generation Error:", err);
+        res.status(500).json({ success: false, message: err.message || 'Failed to generate invoice.' });
+    }
+});
+
+// 2.5 Ledger reconciliation sync — force aligns bookings totals to transactions
+router.post('/api/admin/bookings/:id/reconcile/sync', requireAdmin, requireRole(['administrator', 'manager']), (req, res) => {
+    const bookingId = req.params.id;
+    getTransactionsPaidSumForReconcile(
+        bookingId,
+        (err, row) => {
+            if (err) return res.status(500).json({ success: false, message: 'Database error counting transactions: ' + err.message });
+            
+            const txPaid = parseFloat(row.tx_paid) || 0;
+            
+            getBookingById(bookingId, async (bookErr, booking) => {
+                if (bookErr || !booking) return res.status(404).json({ success: false, message: 'Booking not found.' });
+                
+                const total = parseFloat(booking.total_amount) || 0;
+                const outstanding = Math.max(0, total - txPaid);
+                
+                // Covers the first live schedule row, not a flat 50% of total — correct for a
+                // client-selected 3-way plan too. total<=0 keeps the booking's existing status,
+                // same as the original threshold block being skipped entirely in that case.
+                const payment_status = total > 0 ? await deriveManualPaymentStatus(bookingId, total, txPaid) : booking.payment_status;
+                
+                // A deposit confirms, same as every other payment path.
+                const newStatus = deriveBookingStatusAfterPayment(booking.status, payment_status);
+
+                const adminUser = req.session.username || 'system';
+                
+                updateBookingLedgerFromReconcile(
+                    txPaid, outstanding, payment_status, newStatus, bookingId,
+                    (upErr) => {
+                        if (upErr) return res.status(500).json({ success: false, message: 'Failed to update booking: ' + upErr.message });
+                        
+                        db.run(
+                            `INSERT INTO audit_log (table_name, record_id, action, new_values, changed_by, change_timestamp)
+                             VALUES ('bookings', ?, 'RECONCILE_SYNC', ?, ?, CURRENT_TIMESTAMP)`,
+                            [bookingId, JSON.stringify({ amount_paid: txPaid, amount_outstanding: outstanding, payment_status }), adminUser],
+                            () => {}
+                        );
+                        db.run(
+                            `INSERT INTO financial_audit_log (event_type, entity_type, entity_id, amount, changed_by, notes)
+                             VALUES ('LEDGER_SYNC', 'booking', ?, ?, ?, ?)`,
+                            [bookingId, txPaid, adminUser, `Synced ledger paid to match transaction ledger. Outstanding: R${outstanding.toFixed(2)}`],
+                            () => {}
+                        );
+                        
+                        (async () => {
+                            await syncBookingToCalendar(bookingId);
+                            alignMilestonePayments(bookingId, txPaid, (psErr) => {
+                                if (psErr) console.error('[Ledger Sync] Milestone alignment failed:', psErr.message);
+                            });
+                            
+                            if (payment_status === 'PAID') {
+                                markInvoicePaidIfOpen(bookingId);
+                            }
+                        })();
+                        
+                        res.json({ success: true, message: 'Ledger aligned and booking synced successfully.', amount_paid: txPaid, amount_outstanding: outstanding, payment_status });
+                    }
+                );
+            });
+        }
+    );
+});
+
+// 3.6 Payment Schedules API (Admin)
+// GET /api/admin/bookings/:id/payment-schedules — get schedules for a booking
+router.get('/api/admin/bookings/:id/payment-schedules', requireAdmin, (req, res) => {
+    const bookingId = req.params.id;
+    // b.* rather than a named column list so payment_plan_changed_at (added by a guarded boot-time
+    // ALTER TABLE) is read when present and simply absent — not an SQL error — on an older database.
+    db.get("SELECT b.*, (SELECT COALESCE(SUM(expected_amount), 0) FROM payment_schedules WHERE booking_id = b.id AND LOWER(COALESCE(status,'pending')) NOT IN ('superseded','cancelled')) AS scheduled_total FROM bookings b WHERE b.id = ?", [bookingId], (bErr, booking) => {
+        if (bErr || !booking) return res.status(404).json({ success: false, message: 'Booking not found.' });
+        
+        getActivePaymentSchedules(bookingId, (err, rows) => {
+            if (err) return res.status(500).json({ success: false, message: err.message });
+            res.json({
+                success: true,
+                total_amount: booking.total_amount || 0,
+                scheduled_total: booking.scheduled_total || 0,
+                // When the client last rearranged their plan from the booking tracker (null if never)
+                // — the Payment Milestones card shows "Last changed by the client on …".
+                payment_plan_changed_at: booking.payment_plan_changed_at || null,
+                schedules: rows || []
+            });
+        });
+    });
+});
+
+// POST /api/admin/bookings/:id/payment-schedules — create or replace schedules
+// Admin-built plans are not bound by the client plan rules (max 4 payments, deposit floor, minimum
+// instalment, due-date window) — only by the sum matching the booking total.
+router.post('/api/admin/bookings/:id/payment-schedules', requireAdmin, requireRole(['administrator', 'manager']), async (req, res) => {
+    const bookingId = req.params.id;
+    const { schedules } = req.body;
+    
+    if (!Array.isArray(schedules)) {
+        return res.status(400).json({ success: false, message: 'Schedules must be an array.' });
+    }
+    
+    for (const item of schedules) {
+        if (!item || typeof item.description !== 'string' || !item.description.trim()) {
+            return res.status(400).json({ success: false, message: 'Each schedule item must have a description.' });
+        }
+        if (!item.due_date) {
+            return res.status(400).json({ success: false, message: 'Each schedule item must have a due date.' });
+        }
+        if (item.expected_amount === undefined || isNaN(parseFloat(item.expected_amount)) || parseFloat(item.expected_amount) < 0) {
+            return res.status(400).json({ success: false, message: 'Each schedule item must have a valid non-negative expected amount.' });
+        }
+    }
+
+    // Replace-all as ONE guarded transaction: the booking total, the client-plan guard and the write
+    // all see the same state, and a failed insert rolls back to the previous plan instead of leaving
+    // a partial schedule. Before this it was a bare db.serialize() DELETE-then-INSERT that any other
+    // statement could interleave with, and the DELETE itself failed (FOREIGN KEY constraint, 500)
+    // once a milestone reminder had been sent for one of the rows.
+    let outcome;
+    try {
+        outcome = await withDbTransaction(async () => {
+            try {
+                await dbRun("BEGIN IMMEDIATE");
+            } catch (beginErr) {
+                console.error('[Schedules] BEGIN IMMEDIATE failed:', beginErr.message);
+                return { status: 500, body: { success: false, message: 'Database busy. Please retry.' } };
+            }
+            try {
+                const booking = await dbGet('SELECT total_amount FROM bookings WHERE id = ?', [bookingId]);
+                if (!booking) {
+                    await dbRun("ROLLBACK").catch(() => {});
+                    return { status: 404, body: { success: false, message: 'Booking not found.' } };
+                }
+
+                // Validate that schedule amounts sum to total_amount (skip if total_amount not yet set)
+                if (schedules.length > 0 && booking.total_amount > 0) {
+                    const scheduleSum = schedules.reduce((s, item) => s + parseFloat(item.expected_amount), 0);
+                    const diff = Math.abs(scheduleSum - parseFloat(booking.total_amount));
+                    if (diff > 0.01) {
+                        await dbRun("ROLLBACK").catch(() => {});
+                        return { status: 400, body: {
+                            success: false,
+                            message: `Schedule amounts sum to R${scheduleSum.toFixed(2)} but booking total is R${parseFloat(booking.total_amount).toFixed(2)}. Adjust amounts so they add up to the booking total.`
+                        } };
+                    }
+                }
+
+                // Client-designed plans: don't silently overwrite a live schedule the client built
+                // and may already be paying against. The admin UI confirms first and resubmits with
+                // acknowledge_override — this is the defense-in-depth backstop for any caller that
+                // skips that confirm. ANY live client row counts: after a client rearranges, the first
+                // row by due date is usually an older paid 'auto'/'admin' deposit, so checking only
+                // the first row let an admin save silently wipe the client's plan.
+                const existing = await dbAll(
+                    "SELECT id, source FROM payment_schedules WHERE booking_id = ? AND LOWER(COALESCE(status,'pending')) NOT IN ('superseded','cancelled')",
+                    [bookingId]);
+                if (existing.some(r => r.source === 'client') && !req.body.acknowledge_override) {
+                    await dbRun("ROLLBACK").catch(() => {});
+                    return { status: 409, body: {
+                        success: false,
+                        requires_override: true,
+                        message: `The client already selected and is paying against a ${existing.length}-payment plan. Resubmit with acknowledge_override to replace it.`
+                    } };
+                }
+
+                // Supersede, never delete (see supersedeLivePaymentSchedules): new rows get new ids,
+                // so milestone reminders fire again for the new dates.
+                await supersedeLivePaymentSchedules(bookingId);
+
+                const sorted = schedules.slice().sort((a, b) => (a.due_date < b.due_date ? -1 : a.due_date > b.due_date ? 1 : 0));
+                for (let idx = 0; idx < sorted.length; idx++) {
+                    const item = sorted[idx];
+                    await insertAdminPaymentScheduleRow(bookingId, item.description.trim(), item.due_date, parseFloat(item.expected_amount), idx + 1);
+                }
+
+                await dbRun("COMMIT");
+                return { ok: true };
+            } catch (txErr) {
+                await dbRun("ROLLBACK").catch(() => {});
+                console.error('[Schedules] Replace failed — rolled back, previous plan kept:', txErr.message);
+                return { status: 500, body: { success: false, message: txErr.message } };
+            }
+        });
+    } catch (e) {
+        console.error('[Schedules] Replace failed:', e.message);
+        return res.status(500).json({ success: false, message: e.message });
+    }
+
+    if (!outcome.ok) return res.status(outcome.status).json(outcome.body);
+
+    if (schedules.length === 0) {
+        return res.json({ success: true, message: 'Payment schedules cleared.' });
+    }
+
+    // After the commit, outside the queue (alignment issues its own unguarded statements): re-derive
+    // which of the new rows bookings.amount_paid already covers.
+    updateBookingMilestones(bookingId, (alignErr) => {
+        if (alignErr) console.error('[Schedules] Milestone alignment failed:', alignErr.message);
+        res.json({ success: true, message: 'Payment schedules updated and aligned successfully.' });
+    });
+});
+
+// POST — reconcile a booking's payment schedule to its total by proportionally rescaling the
+// PENDING milestones (paid milestones are preserved). Money only changes on this explicit action.
+router.post('/api/admin/bookings/:id/payment-schedules/rebalance', requireAdmin, requireRole(['administrator', 'manager']), (req, res) => {
+    const bookingId = req.params.id;
+    getBookingTotalAmount(bookingId, (bErr, booking) => {
+        if (bErr || !booking) return res.status(404).json({ success: false, message: 'Booking not found.' });
+        const total = parseFloat(booking.total_amount) || 0;
+        if (total <= 0) return res.status(400).json({ success: false, message: 'Set a booking total before rebalancing the schedule.' });
+
+        getActivePaymentSchedules(bookingId, (err, schedules) => {
+            if (err) return res.status(500).json({ success: false, message: err.message });
+            if (!schedules || schedules.length === 0) return res.status(400).json({ success: false, message: 'No payment schedule to rebalance. Set up milestones first.' });
+
+            const isPaid = s => String(s.status).toLowerCase() === 'paid';
+            const paid = schedules.filter(isPaid);
+            const pending = schedules.filter(s => !isPaid(s));
+            const paidSum = paid.reduce((s, x) => s + (parseFloat(x.expected_amount) || 0), 0);
+            const remaining = Math.round((total - paidSum) * 100) / 100;
+
+            if (remaining < -0.01) {
+                return res.status(400).json({ success: false, message: `Paid milestones (R${paidSum.toFixed(2)}) already exceed the booking total (R${total.toFixed(2)}). Record a refund or adjust the total instead.` });
+            }
+            if (pending.length === 0) {
+                if (Math.abs(remaining) <= 0.01) return res.json({ success: true, message: 'Schedule already matches the booking total.' });
+                return res.status(400).json({ success: false, message: 'All milestones are already paid. Edit the booking total to reconcile.' });
+            }
+
+            // Proportional split of the remaining amount across pending milestones; the last row
+            // absorbs the rounding drift so the sum is exact.
+            const pendSum = pending.reduce((s, x) => s + (parseFloat(x.expected_amount) || 0), 0);
+            const rounded = pending.map(s => {
+                const prop = pendSum > 0 ? (parseFloat(s.expected_amount) || 0) / pendSum : 1 / pending.length;
+                return Math.round(remaining * prop * 100) / 100;
+            });
+            const drift = Math.round((remaining - rounded.reduce((a, b) => a + b, 0)) * 100) / 100;
+            rounded[rounded.length - 1] = Math.max(0, Math.round((rounded[rounded.length - 1] + drift) * 100) / 100);
+            const newAmounts = pending.map((s, i) => ({ id: s.id, amount: rounded[i] }));
+
+            db.serialize(() => {
+                const stmt = prepareUpdatePaymentScheduleAmount();
+                let upErr = null;
+                newAmounts.forEach(u => stmt.run([u.amount, u.id], e => { if (e) upErr = e; }));
+                stmt.finalize((finErr) => {
+                    if (upErr || finErr) return res.status(500).json({ success: false, message: (upErr || finErr).message });
+
+                    db.run(`INSERT INTO audit_log (table_name, record_id, action, changed_by, changes_json) VALUES ('payment_schedules', ?, 'REBALANCE_SCHEDULE', ?, ?)`,
+                        [bookingId, req.session.adminId || req.session.username || 'admin', JSON.stringify({ total, paidSum, remaining, milestones: newAmounts })], () => {});
+
+                    updateBookingMilestones(bookingId, () => {
+                        getActivePaymentSchedules(bookingId, (e2, rows) => {
+                            const scheduled_total = (rows || []).reduce((s, x) => s + (parseFloat(x.expected_amount) || 0), 0);
+                            res.json({ success: true, message: 'Schedule rebalanced to the booking total.', schedules: rows || [], scheduled_total, total_amount: total });
+                        });
+                    });
+                });
+            });
+        });
+    });
+});
+
+// Phase 5 (HOUSEKEEPING-NOTES.md): BOOKING_DELETE_PURGE/BOOKING_DELETE_UNLINK moved into
+// routes/admin/bookings.js as single-consumer locals alongside the delete route.
+router.delete('/api/admin/bookings/:id', requireAdmin, requireRole(['administrator']), async (req, res) => {
+    const id = req.params.id;
+    try {
+        const booking = await getBookingByIdAsync(id);
+        if (!booking) return res.status(404).json({ success: false, message: 'Booking not found.' });
+        if (parseFloat(booking.amount_paid) > 0) {
+            return res.status(400).json({ success: false, message: 'Cannot delete a booking with recorded payments. Cancel it instead to preserve the financial audit trail.' });
+        }
+        const eftProofFiles = (await dbAll('SELECT proof_filename FROM eft_payment_submissions WHERE booking_id = ?', [id])).map(r => r.proof_filename);
+
+        const outcome = await withDbTransaction(async () => {
+            try {
+                await dbRun("BEGIN IMMEDIATE");
+            } catch (beginErr) {
+                console.error('[Delete] BEGIN IMMEDIATE failed:', beginErr.message);
+                return { status: 500, body: { success: false, error: 'Database busy. Please retry.' } };
+            }
+            try {
+                // The failing statement is named in the error: SQLite's own "FOREIGN KEY constraint failed" does not say which table.
+                const runStep = async (sql) => { try { await dbRun(sql, [id]); } catch (stepErr) { stepErr.message += ' [at: ' + sql.slice(0, 90) + ']'; throw stepErr; } };
+                for (const sql of BOOKING_DELETE_PURGE) await runStep(sql);
+                for (const sql of BOOKING_DELETE_UNLINK) await runStep(sql);
+
+                // Inside the transaction: a failed delete must not leave an audit_log row claiming
+                // the booking was deleted. This previously ran before the transaction even opened.
+                await dbRun(
+                    `INSERT INTO audit_log (table_name, record_id, action, old_values, new_values, changed_by, ip_address) VALUES ('bookings', ?, 'DELETE', ?, '{}', 'admin', ?)`,
+                    [id, JSON.stringify(booking), req.ip || null]
+                );
+
+                const del = await deleteBookingById(id);
+                if (del.changes === 0) {
+                    await dbRun("ROLLBACK").catch(() => {});
+                    return { status: 404, body: { success: false, message: 'Booking not found.' } };
+                }
+                await dbRun("COMMIT");
+                return { ok: true };
+            } catch (dbErr) {
+                await dbRun("ROLLBACK").catch(() => {});
+                console.error('[Delete] Cascade failed — rolled back, booking left intact:', dbErr.message);
+                return { status: 500, body: { success: false, error: 'Cascade delete failed.' } };
+            }
+        });
+
+        if (!outcome.ok) return res.status(outcome.status).json(outcome.body);
+
+        // Only once the booking is really gone. This used to run before the transaction, so a
+        // failed delete still destroyed the Google Calendar event of a booking that still existed.
+        if (booking.google_event_id) {
+            deleteGoogleEvent(booking.google_event_id).catch(e => console.error('[Delete] GCal cleanup failed:', e.message));
+        }
+        // the proof files of the submissions that went with it - personal financial documents must not outlive their booking
+        for (const f of eftProofFiles) objectStorage.deleteFile(path.join(DOCS_PATH, 'payment_proofs', f)).catch(e => console.error('[Delete] EFT proof cleanup failed:', e.message));
+        res.json({ success: true });
+    } catch (e) {
+        console.error('[Delete] Booking delete failed:', e);
+        res.status(500).json({ success: false, error: 'Failed to delete booking.' });
+    }
+});
+
+// Phase 5 (HOUSEKEEPING-NOTES.md): the entire events cluster — VALID_EVENT_STATUSES,
+// VALID_EVENT_TYPES, checkEventConflicts, and all 6 /api/admin/events/* routes — moved to
+// routes/admin/events.js. Single-consumer within that cluster; nothing else in app.js referenced
+// any of the three.
+
+
+
+
+// Admin Booking Direct Email Responder
+router.post('/api/admin/bookings/:id/respond', requireAdmin, (req, res) => {
+    const { email, subject, message: rawMessage } = req.body;
+    // Quill's HTML arrives unescaped (RAW_HTML_BODY_FIELDS in app.js) - strip scripts/handlers instead.
+    const message = sanitizeAboutHtml(rawMessage);
+    const bookingId = req.params.id;
+
+    if (!email || !subject || !message) {
+        return res.status(400).json({ success: false, message: 'Missing email, subject, or message.' });
+    }
+
+    // Audit gap closed: this admin->client responder wasn't in the original email inventory.
+    // It already used its own self-built shell correctly (unlike the dead-template bug found in
+    // inquiry-reply/compose) — migrated to the shared component system for consistency.
+    bannerRegistry.resolveBanner('booking_management_response').then(banner => {
+    const htmlTemplate = emailComponents.renderPremiumEmail({
+        preheaderText: `Re: Booking Request #${bookingId}`,
+        bannerSrc: banner?.src, bannerAlt: banner?.alt, subtitle: banner?.subtitle,
+        headline: banner?.headline || 'Management Response',
+        bodyHtml: `<p style="color:#B0B0B0; font-size:13px; margin:0 0 12px;">In reference to Booking Request #${bookingId}</p>` + message.replace(/\n/g, '<br>')
+    });
+
+    sendEmail({
+        to: email,
+        subject: subject,
+        htmlContent: htmlTemplate,
+        preWrapped: true,
+        replyTo: getSenderEmail() || process.env.NOTIFICATION_EMAIL || 'admin@culchar.example',
+        titleOverride: 'Booking Management Response',
+        trigger_event: 'Admin: Booking Respond'
+    }).then(result => {
+        if (result.success) {
+            // Log outgoing communication for the booking's email history (store plain-text snippet)
+            const textSnippet = message.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().substring(0, 1000);
+            db.run(
+                `INSERT INTO communication_log (booking_id, direction, channel, subject, content_snippet, sent_at)
+                 VALUES (?, 'outgoing', 'email', ?, ?, CURRENT_TIMESTAMP)`,
+                [bookingId, subject, textSnippet]
+            );
+            // Auto-update booking status upon send
+            markBookingPendingAfterRespond(bookingId, function(err) {
+                if (err) console.error("Error auto-updating status to PENDING:", err);
+                res.json({ success: true, message: 'Response dispatched successfully and status updated.' });
+            });
+        } else {
+            throw new Error(result.error);
+        }
+    }).catch(error => {
+        console.error('Error dispatching admin response email:', error);
+        res.status(500).json({ success: false, message: 'Failed to dispatch email.', error: error.toString() });
+    });
+    });
+});
+
+// Admin: manually record a payment when the PayFast ITN was not received
+router.put('/api/admin/bookings/:id/manual-payment', requireAdmin, requireRole(['administrator', 'manager']), (req, res, next) => {
+    paymentProofUpload.single('proof_of_payment')(req, res, function(err) {
+        if (err) {
+            return res.status(400).json({ success: false, message: err.message || 'Invalid file. Only PDF, JPEG, PNG, or WEBP files are accepted.' });
+        }
+        next();
+    });
+}, async (req, res) => {
+    if (!req.file) return res.status(400).json({ success: false, message: 'Proof of payment is required. Attach a PDF, JPEG, PNG, or WEBP file.' });
+    const { payment_status, amount_paid, force } = req.body;
+    // payment_status is advisory now — processManualPayment derives the real value from the amount
+    // (an admin could otherwise record R1 as PAID). Still reject a garbage value if one is supplied,
+    // but do not require it.
+    const valid = ['UNPAID', 'DEPOSIT_PAID', 'PARTIALLY_PAID', 'PAID', 'FAILED'];
+    if (payment_status != null && payment_status !== '' && !valid.includes(payment_status)) {
+        return res.status(400).json({ success: false, message: 'Invalid payment_status.' });
+    }
+    getBookingById(req.params.id, (err, row) => {
+        if (err || !row) return res.status(404).json({ success: false, message: 'Booking not found.' });
+        if (['CANCELLED', 'EXPIRED'].includes(row.status)) {
+            return res.status(400).json({ success: false, message: `Cannot record payment on a ${row.status} booking.` });
+        }
+
+        // P2-5: Warn if a PayFast transaction was recorded for this booking within the last 2 hours —
+        // recording a manual payment on top may create a duplicate credit.
+        if (!force) {
+            getRecentPayfastTransactionForBooking(
+                req.params.id,
+                (txErr, recentTx) => {
+                    if (!txErr && recentTx) {
+                        return res.status(409).json({
+                            success: false,
+                            duplicate_warning: true,
+                            message: `A PayFast payment of R${parseFloat(recentTx.amount).toFixed(2)} was already recorded for this booking within the last 2 hours (at ${recentTx.created_at}). Recording a manual payment now may double-credit this booking. Send { force: true } to proceed anyway.`
+                        });
+                    }
+                    // No recent PayFast tx — fall through to same-callback logic below
+                    processManualPayment(req, res, row);
+                }
+            );
+            return;
+        }
+        processManualPayment(req, res, row);
+    });
+});
+
+// P2.1 — Cancel booking (admin) — writes to cancellations table and notifies client
+router.post('/api/admin/bookings/:id/cancel', requireAdmin, async (req, res) => {
+    const bookingId = req.params.id;
+    const { reason, cancelled_by, notes } = req.body;
+    const validCancelledBy = ['client', 'comedian', 'mutual', 'force_majeure'];
+    const cancelledBy = validCancelledBy.includes(cancelled_by) ? cancelled_by : 'comedian';
+
+    getBookingById(bookingId, (err, booking) => {
+        if (err || !booking) return res.status(404).json({ success: false, message: 'Booking not found.' });
+        const currentStatus = (booking.status || '').toUpperCase();
+        if (['COMPLETED', 'CANCELLED'].includes(currentStatus)) {
+            return res.status(400).json({ success: false, message: `Cannot cancel a booking with status ${booking.status}.` });
+        }
+        
+        db.get("SELECT policy_value FROM policies WHERE policy_key = 'cancellation_policy'", async (err, policy) => {
+            // SC-2: Force majeure — full refund regardless of timeline
+            const isForceMajeure = cancelledBy === 'force_majeure';
+            const policyStr = policy ? policy.policy_value : "";
+            const calc = calculateCancellationRefund(booking, policyStr);
+            const totalPaid = calc.totalPaid;
+            const refundDue       = isForceMajeure ? totalPaid : calc.refund;
+            const retentionAmount = isForceMajeure ? 0          : calc.retention;
+            const policyRule      = isForceMajeure ? 'Force Majeure: Full Refund Granted' : calc.rule;
+
+            // Everything a cancellation implies is one atomic unit. The audit row and the four
+            // cascades (holds, invoices, payment schedules, events) used to run AFTER `COMMIT` with
+            // their errors logged and ignored, so a cancelled booking could keep an open invoice the
+            // admin would go on chasing.
+            let linkedEventGoogleId = null;
+            const outcome = await withDbTransaction(async () => {
+                try {
+                    await dbRun("BEGIN IMMEDIATE");
+                } catch (beginErr) {
+                    console.error('[Cancel] BEGIN IMMEDIATE failed:', beginErr.message);
+                    return { status: 500, body: { success: false, message: 'Database busy. Please retry.' } };
+                }
+                try {
+                    // payment_status is deliberately NOT set to 'CANCELLED'. The
+                    // chk_bookings_payment_status_update trigger only permits
+                    // UNPAID|DEPOSIT_PAID|PARTIALLY_PAID|PAID|REFUNDED|FAILED, so writing 'CANCELLED'
+                    // aborted the whole statement — this route returned 500 on every call. The real
+                    // payment state must survive cancellation anyway: the refund owed is computed
+                    // from what the client actually paid.
+                    //
+                    // P0-2: cancelBookingAsync's UPDATE is itself guarded (status NOT IN
+                    // ('CANCELLED','COMPLETED')) — this booking left that window between the
+                    // currentStatus check above (a read, before this transaction opened) and here. 0
+                    // rows changed means the race was lost to a concurrent action (e.g. the client's
+                    // own accept-quote or self-cancel); roll back rather than run the cascade below
+                    // over a state this request no longer has an accurate picture of.
+                    const cancelResult = await cancelBookingAsync(bookingId);
+                    if (!cancelResult || cancelResult.changes === 0) {
+                        await dbRun("ROLLBACK").catch(() => {});
+                        return { status: 409, body: { success: false, message: 'This booking was already changed by another action (e.g. accepted or cancelled elsewhere) just before this cancellation could complete. Please refresh and try again.' } };
+                    }
+
+                    await insertCancellationForAdminCancel(bookingId, cancelledBy, reason || null, totalPaid, refundDue, retentionAmount, notes || null, req.session.adminId);
+
+                    await dbRun(
+                        `INSERT INTO audit_log (table_name, record_id, action, old_values, new_values, changed_by, change_timestamp)
+                         VALUES ('bookings', ?, 'CANCEL', ?, ?, ?, CURRENT_TIMESTAMP)`,
+                        [bookingId,
+                         JSON.stringify({ status: booking.status, payment_status: booking.payment_status }),
+                         JSON.stringify({ status: 'CANCELLED', cancelled_by: cancelledBy, reason: reason || null, refund_due: refundDue, retention: retentionAmount, policy_rule: policyRule }),
+                         req.session.adminId || 'admin']);
+
+                    // Release date holds
+                    await releaseDateHoldsForBookingAsync(bookingId);
+                    // Cascade: void open invoices so admin stops chasing payment
+                    await voidInvoicesForCancelledBookingAsync(bookingId);
+                    // Cascade: cancel pending payment schedule items
+                    await cancelPendingPaymentSchedulesAsync(bookingId);
+                    // Cascade: demote the linked event to draft/cancelled AND clear both cross-reference
+                    // FKs (bookings.event_id <-> events.booking_id) — this used to only clear the event's
+                    // side (booking_id=NULL) while applyStatusChange's CANCELLED branch only cleared the
+                    // booking's side (event_id=NULL) and demoted the event, so depending on which of the
+                    // two cancellation entry points fired, the pair ended up pointing at each other
+                    // inconsistently and a publicly-listed show could keep showing 'upcoming' after its
+                    // booking was cancelled. Matches by booking_id (the event's own pointer) rather than
+                    // only booking.event_id, so a pre-existing orphaned cross-reference left by that
+                    // inconsistency still gets cleaned up here rather than silently skipped.
+                    const linkedEvent = await getEventByBookingId(bookingId);
+                    if (linkedEvent) linkedEventGoogleId = linkedEvent.google_calendar_event_id || null;
+                    await demoteEventForCancelledBookingByBookingIdAsync('Linked booking #' + bookingId + ' was cancelled', bookingId);
+                    if (booking.event_id) {
+                        await clearBookingPublicAndEventIdAsync(bookingId);
+                    }
+                    // The event may have its own separate Google Calendar entry (synced via
+                    // syncEventToCalendar, independent of the booking's own google_event_id, handled as
+                    // a post-commit side effect below alongside it) — without clearing it here too, it
+                    // stays live/public on Google even though it's now locally demoted to draft.
+                    if (linkedEventGoogleId) {
+                        await clearEventGoogleCalendarIdAsync(linkedEvent.event_id);
+                    }
+
+                    await dbRun("COMMIT");
+                    return { ok: true };
+                } catch (txErr) {
+                    await dbRun("ROLLBACK").catch(() => {});
+                    console.error('[Cancel] Cancellation failed — rolled back, booking unchanged:', txErr.message);
+                    return { status: 500, body: { success: false, message: txErr.message } };
+                }
+            });
+
+            if (!outcome.ok) return res.status(outcome.status).json(outcome.body);
+
+            // ---- Side effects, after the commit ----
+            // Remove Google Calendar event so date shows as available
+            if (booking.google_event_id) {
+                deleteGoogleEvent(booking.google_event_id).catch(calErr => {
+                    console.error(`[Cancel] Google Calendar event removal failed for booking #${bookingId}:`, calErr.message);
+                });
+                // Null it regardless of the delete's outcome above — deleteGoogleEvent() never rejects
+                // (it swallows its own errors), and leaving a stale ID here permanently breaks any later
+                // sync attempt for this booking (update-against-a-deleted-event fails silently forever).
+                clearBookingGoogleEventId(bookingId);
+            }
+            // The linked event's own separate Google Calendar entry (if any) — already nulled in the DB
+            // inside the transaction above; the actual Google delete call happens here, after commit,
+            // same as the booking's own event above.
+            if (linkedEventGoogleId) deleteGoogleEvent(linkedEventGoogleId);
+            booking.name = booking.client_name || booking.name;
+            booking.email = booking.client_email || booking.email;
+            // SC-3: Pass policy rule + timing so client knows what was applied
+            require('../../lib/notify').emit('bookings.cancelled', { bookingId: Number(bookingId), by: 'admin', actorLabel: req.session.username, clientName: booking.name, eventDate: booking.date, reason, refundDue }, { req });
+            require('../../lib/notify').resolve('bookings.request_received', bookingId, { req, note: 'The booking was cancelled.' });
+            try { await sendCancellationEmail(booking, { reason, refund_due: refundDue, rule: policyRule, days_until_event: calc.daysUntilEvent, is_force_majeure: isForceMajeure }); }
+            catch (e) { console.error('Cancellation email failed:', e.message); }
+            res.json({ success: true, message: 'Booking cancelled and client notified.', refund_due: refundDue, rule: policyRule });
+        });
+    });
+});
+
+/**
+ * POST /api/admin/bookings/:id/complete
+ * Mark a CONFIRMED booking as COMPLETED and notify the client.
+ */
+router.post('/api/admin/bookings/:id/complete', requireAdmin, (req, res) => {
+    const bookingId = req.params.id;
+    getBookingById(bookingId, (err, booking) => {
+        if (err || !booking) return res.status(404).json({ success: false, message: 'Booking not found.' });
+        if (booking.status !== 'CONFIRMED') {
+            return res.status(400).json({ success: false, message: `Only CONFIRMED bookings can be marked complete (current: ${booking.status}).` });
+        }
+        const outstanding = parseFloat(booking.amount_outstanding) || 0;
+        const force = req.body && req.body.force === true;
+        if (outstanding > 0 && !force) {
+            return res.status(400).json({
+                success: false,
+                message: `Cannot complete: outstanding balance of R${outstanding.toFixed(2)} remains. Settle payment first, or pass force:true to override.`,
+                amount_outstanding: outstanding
+            });
+        }
+        markBookingCompletedManual(bookingId, async function(upErr) {
+            if (upErr) return res.status(500).json({ success: false, error: upErr.message });
+            db.run(
+                `INSERT INTO audit_log (table_name, record_id, action, old_values, new_values, changed_by, change_timestamp)
+                 VALUES ('bookings', ?, 'COMPLETE', ?, ?, ?, CURRENT_TIMESTAMP)`,
+                [bookingId,
+                 JSON.stringify({ status: booking.status }),
+                 JSON.stringify({ status: 'COMPLETED', forced: force || false }),
+                 req.session.adminId || 'admin'],
+                (aErr) => { if (aErr) console.error('[Audit] Completion log failed:', aErr.message); }
+            );
+            booking.name  = booking.client_name  || booking.name;
+            booking.email = booking.client_email || booking.email;
+            sendBookingCompletedEmail(booking).catch(e => console.error('Completed email failed:', e.message));
+            // Parity with applyStatusChange's COMPLETED branch and the S6 auto-complete sweep
+            // (lib/background-clerk.js) — this dedicated route was missing both, so a booking
+            // completed via the admin's "Mark Complete" button never had its invoice auto-marked
+            // paid, and the admin never got the completion summary email.
+            markInvoicePaidOnStatusComplete(bookingId);
+            sendAdminCompletionSummaryEmail(booking).catch(e => console.error('Admin completion summary failed:', e.message));
+            // Advance linked event to 'completed' status
+            if (booking.event_id) {
+                advanceEventToCompleted(booking.event_id,
+                    (evErr) => { if (evErr) console.error('[Complete] Event status advance failed:', evErr.message); }
+                );
+            }
+            res.json({ success: true, message: 'Booking marked as completed and client notified.' });
+        });
+    });
+});
+
+/**
+ * PUT /api/admin/bookings/:id/refund
+ * Record that a refund has been issued for a cancelled booking.
+ */
+router.put('/api/admin/bookings/:id/refund', requireAdmin, requireRole(['administrator', 'manager']), async (req, res) => {
+    const { refund_amount, refund_reference, notes } = req.body;
+    const bookingId = req.params.id;
+    const amt = parseFloat(refund_amount) || 0;
+
+    if (amt < 0) {
+        return res.status(400).json({ success: false, message: 'Refund amount cannot be negative.' });
+    }
+    if (amt > 0 && (!refund_reference || !refund_reference.trim())) {
+        return res.status(400).json({ success: false, message: 'A payment reference (bank transaction ID or PayFast reference) is required when recording a refund. Process the bank/PayFast transfer first, then record the reference here.' });
+    }
+
+    try {
+        const row = await getCancellationForRefund(bookingId);
+        if (!row) return res.status(404).json({ success: false, message: 'No cancellation record found for this booking.' });
+
+        // Validate against what has ACTUALLY been refunded so far (the transactions ledger — the
+        // same source of truth the amount_paid recalculation below reads from), not just the single
+        // amount submitted in this call. Comparing `amt` alone against total_paid_to_date let two
+        // separate calls each pass the check individually and refund more than the client ever paid.
+        const refRow = await getAlreadyRefundedAmount(bookingId);
+        const alreadyRefunded = parseFloat(refRow && refRow.already_refunded) || 0;
+        const remaining = row.total_paid_to_date - alreadyRefunded;
+
+        if (amt > remaining) {
+            return res.status(400).json({
+                success: false,
+                message: alreadyRefunded > 0
+                    ? `Refund amount (R${amt.toFixed(2)}) exceeds the remaining refundable balance (R${remaining.toFixed(2)}). R${alreadyRefunded.toFixed(2)} of R${row.total_paid_to_date.toFixed(2)} paid has already been refunded.`
+                    : `Refund amount (R${amt.toFixed(2)}) exceeds total paid (R${row.total_paid_to_date.toFixed(2)}).`
+            });
+        }
+
+        // refund_amount/reference/notes reflect the running total across possibly multiple partial
+        // refunds — overwriting them on each call erased the previous bank reference and understated
+        // the total refunded on the client's public tracking page.
+        const cumulativeRefund = alreadyRefunded + amt;
+        const cumulativeReference = refund_reference
+            ? (row.refund_reference ? `${row.refund_reference}; ${refund_reference}` : refund_reference)
+            : row.refund_reference || null;
+        const cumulativeNotes = notes
+            ? (row.refund_notes ? `${row.refund_notes}\n${notes}` : notes)
+            : row.refund_notes || null;
+
+        await updateCancellationRefund(cumulativeRefund, cumulativeReference, cumulativeNotes, bookingId);
+
+        // P2-11: Record refund transaction first, then recalculate amount_paid from
+        // SUM(transactions) to avoid ledger drift from arithmetic operations.
+        await insertRefundTransaction(bookingId, amt, refund_reference || null, notes || `Refund for cancellation of Booking #${bookingId}`)
+            .catch(tErr => console.error('[Refund] Transaction log failed:', tErr.message));
+
+        // receivedAmountSql: payments minus refunds / chargebacks, and NO manual adjustments - an adjustment changes what is owed, not what
+        // was paid, and counting it here inflated amount_paid after a cancellation refund.
+        await dbRun(`UPDATE bookings SET
+                amount_paid = MAX(0, (
+                    SELECT COALESCE(SUM(${receivedAmountSql('t')}), 0)
+                    FROM transactions t WHERE t.booking_id = bookings.id
+                      AND t.is_duplicate = 0 AND (t.status = 'completed' OR t.status IS NULL)
+                )),
+                amount_outstanding = MAX(0, COALESCE(total_amount, 0) - MAX(0, (
+                    SELECT COALESCE(SUM(${receivedAmountSql('t')}), 0)
+                    FROM transactions t WHERE t.booking_id = bookings.id
+                      AND t.is_duplicate = 0 AND (t.status = 'completed' OR t.status IS NULL)
+                )))
+                WHERE id = ?`, [bookingId]
+        ).catch(bErr => console.error('[Refund] Ledger recalculation failed:', bErr.message));
+
+        db.run(`INSERT OR IGNORE INTO audit_log (table_name, record_id, action, new_values) VALUES ('cancellations', ?, 'REFUND_ISSUED', ?)`,
+            [bookingId, JSON.stringify({ refund_amount: amt, refund_reference, cumulative_refund: cumulativeRefund })]);
+        require('../../lib/notify').emit('finance.refund_recorded', { bookingId, amount: amt, reference: refund_reference || null }, { req });   // Activity Log (docs-internal/notifications.md)
+
+        // Re-derive payment_status from the recomputed ledger. This route recomputed
+        // amount_paid/amount_outstanding but left payment_status stale, so a fully
+        // refunded booking stayed marked PAID. Same derivation the /transactions/manual
+        // refund branch uses. (trg_auto_payment_status only ever forces PAID when
+        // outstanding hits 0, so it cannot demote a refunded booking on its own.)
+        const bRow = await getBookingByIdAsync(bookingId);
+        if (!bRow) {
+            return res.json({ success: true, message: `Refund of R${amt.toFixed(2)} recorded and transaction logged.` });
+        }
+        const total = parseFloat(bRow.total_amount) || 0;
+        const newPaid = parseFloat(bRow.amount_paid) || 0;
+        // Covers the first live schedule row, not a flat 50% of total — correct for a
+        // client-selected 3-way plan too.
+        const payment_status = await deriveManualPaymentStatus(bookingId, total, newPaid);
+        // Awaited so the response never goes out ahead of the write — a caller (or test) that reads
+        // the booking straight after this returns must see the re-derived status. A failed write is
+        // still only logged, as before; it never fails the refund.
+        await new Promise(resolve => setBookingPaymentStatus(payment_status, bookingId, (psErr) => {
+            if (psErr) console.error('[Refund] payment_status re-derivation failed:', psErr.message);
+            resolve();
+        }));
+        // amount_paid dropped — re-run the milestone waterfall so covered rows
+        // that are no longer covered fall back to pending.
+        alignMilestonePayments(bookingId, newPaid, () => {});
+
+        sendRefundProcessedEmail(bRow, amt, refund_reference)
+            .catch(e => console.error('[Refund] Client email failed:', e.message));
+        res.json({ success: true, message: `Refund of R${amt.toFixed(2)} recorded and transaction logged.`, payment_status });
+    } catch (e) {
+        console.error('[Refund] Failed:', e.message);
+        res.status(500).json({ success: false, message: 'Server error recording refund.' });
+    }
+});
+
+module.exports = router;

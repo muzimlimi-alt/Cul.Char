@@ -1,0 +1,272 @@
+/* =====================================================================
+   ADMIN — MISC · services catalogue redesign
+   Extracted verbatim from admin.html (inline <style> block 15 of 20,
+   was lines 3518-3748). Content unchanged; only this header is new.
+
+   LOAD ORDER — the <link> replacing this block sits at the exact document
+   position the block occupied. Several rules in admin.html win only on source
+   order, so this file must not be moved, merged or reordered without
+   re-running scripts/css-parity.js. See docs-internal/css-refactor-log.md.
+
+   Rule mix: misc:98, components:26, shell:1
+   ===================================================================== */
+
+
+/* ── Services Catalogue Redesign ──
+   Cards now use the same shared list shell as Events/Accolades/Career/etc. (.atl-edit-card:
+   icon thumb + main column + right-aligned icon actions) instead of a bespoke multi-column
+   tile grid, so the Services tab reads as one more section of the same admin, not an outlier.
+   Services have no photo, so the thumb is a category icon (see _svcThumbIcon in services.js). */
+.svc-card-grid { display:flex; flex-direction:column; gap:16px; }
+.svc-card--archived .atl-edit-card__header { opacity:.6; }
+.svc-card--archived { border-style: dashed; }
+.svc-card .atl-edit-card__header { align-items:center; }
+.svc-card__thumb {
+    width:56px; height:56px; flex-shrink:0;
+    display:flex; align-items:center; justify-content:center;
+    border-radius:10px; border:1px solid var(--atl-line); background:var(--atl-paper);
+    color:var(--atl-amber); font-size:19px;
+}
+.svc-card__main { flex:1 1 240px; min-width:0; }
+.svc-card__cat-badge { font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.6px; padding:2px 8px; border-radius:var(--atl-r-pill); }
+.svc-cat--performance { background:color-mix(in srgb, var(--atl-amber) 15%, transparent); color:var(--atl-amber); }
+.svc-cat--travel      { background:color-mix(in srgb, var(--atl-blue) 15%, transparent);  color:var(--atl-blue); }
+.svc-cat--production  { background:color-mix(in srgb, var(--atl-sage) 15%, transparent);  color:var(--atl-sage); }
+.svc-cat--other       { background:color-mix(in srgb, var(--atl-muted) 12%, transparent); color:var(--atl-muted); }
+.svc-card__name { margin:0; }
+.svc-card__desc { font-size:12px; color:var(--atl-muted); margin:6px 0 0; line-height:1.5; display:-webkit-box; -webkit-line-clamp:2; line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+.svc-card__price { display:flex; align-items:baseline; flex-wrap:wrap; gap:8px; font-size:16px; font-weight:700; color:var(--atl-amber); margin:4px 0 0; }
+.svc-card__model-badge { font-size:10px; font-weight:600; color:var(--atl-muted); background:color-mix(in srgb, var(--atl-ink) 5%, transparent); border:1px solid var(--atl-line); border-radius:var(--atl-r-pill); padding:2px 7px; }
+.svc-card__limits { font-size:11px; color:var(--atl-muted); margin:4px 0 0; }
+.svc-card__unit { font-size:11px; font-style:italic; color:var(--atl-muted-dim); margin:4px 0 0; }
+.svc-card__badges { display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin:6px 0 0; }
+.svc-tag { font-size:10px; font-weight:600; padding:2px 7px; border-radius:var(--atl-r-pill); display:inline-flex; align-items:center; gap:4px; }
+.svc-tag--travel { background:color-mix(in srgb, var(--atl-blue) 12%, transparent); color:var(--atl-blue); }
+.svc-tag--perday { background:color-mix(in srgb, var(--atl-amber) 12%, transparent);  color:var(--atl-amber); }
+.svc-tag--note   { background:color-mix(in srgb, var(--atl-muted) 10%, transparent);  color:var(--atl-muted); cursor:help; }
+/* Stacked, icon-only squares — matches the Edit/Delete pair every other admin card list uses
+   (Events, Accolades, Gallery, Footprint, Testimonials), not the old full-width labelled pair. */
+.svc-card__actions { display:flex; flex-direction:column; align-items:flex-end; gap:6px; flex-shrink:0; margin-left:auto; }
+.svc-empty-state { text-align:center; padding:60px 20px; color:var(--atl-muted); }
+.svc-empty-state i { font-size:40px; display:block; margin-bottom:16px; opacity:.3; }
+.svc-empty-state p { font-size:14px; margin-bottom:16px; }
+
+/* Services Drawer */
+.svc-drawer-backdrop { position:fixed; inset:0; background:rgba(0,0,0,.5); z-index:1040; }
+.svc-drawer {
+    position:fixed; top:0; right:0; width:480px; max-width:96vw; height:100vh; height:100dvh;
+    background:var(--atl-surface2,#1a1a1a); border-left:1px solid var(--atl-line);
+    z-index:1050; display:flex; flex-direction:column;
+    transform:translateX(100%); transition:transform .25s cubic-bezier(.4,0,.2,1), box-shadow .25s ease;
+    box-shadow:none;
+}
+.svc-drawer--open { transform:translateX(0); box-shadow:-8px 0 32px rgba(0,0,0,.4); }
+.svc-drawer__header { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; padding:20px 20px 16px; border-bottom:1px solid var(--atl-line); flex-shrink:0; }
+.svc-drawer__body { flex:1; overflow-y:auto; padding:20px; }
+.svc-drawer__section-label { font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.8px; color:var(--atl-amber); margin:18px 0 10px; padding-bottom:6px; border-bottom:1px solid var(--atl-line); display:block; }
+.svc-drawer__body .svc-drawer__section-label:first-child { margin-top:0; }
+.svc-drawer__footer { display:flex; gap:10px; padding:16px 20px; border-top:1px solid var(--atl-line); flex-shrink:0; }
+.svc-drawer__header h3 { font-family:'Outfit',sans-serif !important; font-size:18px !important; font-weight:600 !important; color:var(--atl-ink) !important; line-height:1.3 !important; letter-spacing:0 !important; margin:0 !important; }
+.svc-drawer__header .atl-section-eyebrow { font-size:10px !important; color:var(--atl-amber) !important; text-transform:uppercase !important; letter-spacing:1px !important; margin:0 0 4px !important; font-family:'Outfit',sans-serif !important; }
+
+/* ── Quote Builder Drawer ── */
+.qb-drawer-backdrop { position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:1040; display:none; }
+.qb-drawer {
+    position:fixed; top:0; right:0; height:100vh; height:100dvh;
+    width:860px; max-width:100vw;
+    background:var(--atl-surface2,#1a1a1a); border-left:1px solid var(--atl-line);
+    z-index:1050; display:flex; flex-direction:column;
+    transform:translateX(100%); transition:transform .3s cubic-bezier(.4,0,.2,1), box-shadow .3s ease;
+    box-shadow:none;
+}
+.qb-drawer--open { transform:translateX(0); box-shadow:-10px 0 48px rgba(0,0,0,.5); }
+.qb-drawer__header {
+    display:flex; align-items:center; justify-content:space-between; gap:12px;
+    padding:16px 24px; border-bottom:1px solid var(--atl-line); flex-shrink:0;
+}
+.qb-drawer__header h5 { font-family:'Outfit',sans-serif !important; font-size:14px !important; font-weight:800 !important; color:var(--atl-ink) !important; letter-spacing:1.5px !important; margin:0 !important; text-transform:uppercase !important; }
+.qb-drawer__body { flex:1; overflow-y:auto; padding:20px 24px; }
+.qb-drawer__footer {
+    display:flex; justify-content:flex-end; gap:10px; flex-wrap:wrap;
+    padding:14px 24px; border-top:1px solid var(--atl-line); flex-shrink:0;
+}
+@media (max-width:900px) {
+    .qb-drawer { width:100vw; border-left:none; }
+    .qb-controls-bar { grid-template-columns:1fr 1fr !important; }
+    .qb-controls-bar > div:last-child { grid-column:1/-1; }
+    .qb-bottom-grid { grid-template-columns:1fr !important; }
+}
+@media (max-width:500px) {
+    .qb-drawer__body   { padding:14px !important; }
+    .qb-drawer__header { padding:12px 14px !important; }
+    .qb-drawer__footer { padding:12px 14px !important; }
+    .qb-controls-bar   { grid-template-columns:1fr !important; }
+    .qb-info-band      { grid-template-columns:1fr !important; }
+    .qb-info-band > div:last-child { border-left:none !important; padding-left:0 !important; border-top:1px solid var(--atl-line); padding-top:10px; margin-top:6px; }
+    .qb-services-hd { flex-direction:column !important; align-items:flex-start !important; }
+    .qb-services-hd > div { max-width:100% !important; width:100%; }
+}
+
+/* ── ATL Generic Drawer System ─────────────────────────────────── */
+.atl-drawer-backdrop {
+    position: fixed; inset: 0; background: var(--atl-overlay);   /* was a hardcoded black .55: now follows the Finish (dark .72, ivory/ember warm) */
+    z-index: 1040; display: none;
+}
+.atl-drawer {
+    position: fixed; top: 0; right: 0; height: 100vh; height: 100dvh;
+    width: 520px; max-width: 100vw;
+    background: var(--atl-card); border-left: 1px solid var(--atl-line);
+    z-index: 1050; display: flex; flex-direction: column;
+    transform: translateX(100%);
+    transition: transform .3s cubic-bezier(.4,0,.2,1), box-shadow .3s ease;
+    box-shadow: none;
+}
+.atl-drawer--480 { width: 480px; }
+.atl-drawer--520 { width: 520px; }
+.atl-drawer--600 { width: 600px; }
+.atl-drawer--640 { width: 640px; }
+.atl-drawer--680 { width: 680px; }
+.atl-drawer--760 { width: 760px; }
+.atl-drawer--860 { width: 860px; }
+.atl-drawer--open { transform: translateX(0); box-shadow: -10px 0 48px var(--atl-overlay); }
+.atl-drawer__header {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding: 18px 24px; border-bottom: 1px solid var(--atl-line); flex-shrink: 0;
+}
+.atl-drawer__header h5 {
+    margin: 0; font-size: 15px; font-weight: 600;
+    /* redesign.css h1-h6{color:var(--text-primary)!important} bleed (same root cause as
+       .atl-edit-card__title/.svc-drawer__header h3) — --text-primary is always white (the public
+       site's own dark-only token), so under light Finish every drawer's title rendered white on the
+       Ivory background. Shared by every admin drawer (~21 of them), so fixing it here fixes all of
+       them at once. */
+    color: var(--atl-ink) !important; display: flex; align-items: center; gap: 10px;
+}
+.atl-drawer__close {
+    background: transparent; border: none; color: var(--atl-muted);
+    font-size: 22px; line-height: 1; cursor: pointer; padding: 2px 6px;
+    border-radius: 6px; transition: color .15s, background .15s;
+}
+.atl-drawer__close:hover { color: var(--atl-ink); background: color-mix(in srgb, var(--atl-ink) 6%, transparent); }
+.atl-drawer__body { flex: 1; overflow-y: auto; padding: 20px 24px; }
+.atl-drawer__footer {
+    display: flex; justify-content: flex-end; align-items: center;
+    gap: 10px; flex-wrap: wrap;
+    padding: 14px 24px;
+    padding-bottom: max(14px, env(safe-area-inset-bottom));
+    border-top: 1px solid var(--atl-line); flex-shrink: 0;
+}
+/* "Last Updated By" meta footer — subtle caption shown at the bottom of every editable
+   record, refreshed live from each save response's `last_updated` field (see
+   js/notificationService.js's success-hook + window.showMetaFooter in admin.html).
+   Inside a real .atl-drawer__footer it sits as the first flex child (margin-right:auto
+   pushes Save/Cancel to the right); the --standalone variant is used when JS inserts it
+   just above a bare .um-form-actions row instead (drawers with no dedicated footer bar). */
+.atl-meta-footer {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 11px; color: var(--atl-muted-dim);
+    margin-right: auto;
+}
+.atl-meta-footer i { font-size: 10px; }
+.atl-meta-footer strong { color: var(--atl-muted); font-weight: 600; }
+.atl-meta-footer--standalone {
+    width: 100%; margin: 4px 0 0;
+    padding: 10px 2px 0; border-top: 1px solid var(--atl-line);
+}
+@media (max-width: 640px) {
+    .atl-drawer { width: 100vw !important; }
+    .atl-drawer__body { padding: 16px; }
+    .atl-drawer__header { padding: 14px 16px; }
+    .atl-drawer__footer { padding: 14px 16px; padding-bottom: max(14px, env(safe-area-inset-bottom)); }
+}
+
+/* ── Deal View (booking) — tabbed content, built on the ATL Generic Drawer System above ── */
+.dv-breadcrumb { font-size: 11px; color: var(--atl-muted); letter-spacing: .04em; }
+.dv-breadcrumb .cur { color: var(--atl-ink-dim); font-family: 'JetBrains Mono', monospace; font-size: 11px; }
+.dv-subhead { padding: 16px 24px 0; border-bottom: 1px solid var(--atl-line); flex-shrink: 0; }
+/* !important: css/redesign.css's blanket h1-h6{color:var(--text-primary)!important} otherwise
+   wins and renders this heading white regardless of theme (see .atl-det-title above). */
+/* body.admin-body prefix matches (and beats) css/style.css's own `body.admin-body h2 {font-family:var(--theme-font)!important}` —
+   a bare `.dv-title{!important}` alone isn't specific enough to win against that selector. */
+body.admin-body .dv-title { font-family: 'Cormorant Garamond', Georgia, serif !important; font-size: clamp(22px,4vw,28px); font-weight: 600; line-height: 1.1; margin: 0 0 4px; color: var(--atl-ink) !important; }
+.dv-subtitle { font-size: 13px; color: var(--atl-muted); margin-bottom: 12px; }
+.dv-subtitle b { color: var(--atl-ink-dim); font-weight: 500; }
+.dv-statusrow { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+.dv-chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+.dv-chip { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--atl-ink-dim); background: var(--atl-input-bg); border: 1px solid var(--atl-line); border-radius: var(--atl-r-pill); padding: 5px 12px; }
+.dv-chip.gold { color: var(--atl-amber); border-color: var(--atl-amber-border); background: var(--atl-amber-dim); }
+.dv-chip .m { font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+/* Right-aligned as a group (Refresh, primary CTA, More) — DOM order is preserved (Refresh
+   first) since, unlike .atl-card-actions-bar, nothing here reorders the primary CTA. */
+.dv-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; margin-bottom: 14px; }
+@media (max-width: 479px) {
+    .dv-actions { flex-direction: column; }
+    .dv-actions > * { width: 100%; }
+    .dv-actions .atl-btn { justify-content: center; text-align: center; }
+}
+
+.dv-tabs { display: flex; gap: 2px; overflow-x: auto; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
+.dv-tabs::-webkit-scrollbar { display: none; }
+.dv-tab { position: relative; white-space: nowrap; background: transparent; border: none; padding: 11px 13px 13px; font-size: 12.5px; font-weight: 500; color: var(--atl-muted); font-family: 'Outfit', sans-serif; letter-spacing: .01em; transition: color .2s ease; cursor: pointer; }
+.dv-tab:hover { color: var(--atl-ink-dim); }
+.dv-tab[aria-selected="true"] { color: var(--atl-amber); font-weight: 600; }
+.dv-tab[aria-selected="true"]::after { content: ""; position: absolute; left: 6px; right: 6px; bottom: -1px; height: 2px; background: var(--atl-amber); border-radius: 2px 2px 0 0; }
+
+.dv-panel[hidden] { display: none; }
+.dv-panel { animation: dvFade .3s ease; }
+@keyframes dvFade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .dv-panel { animation: none; } }
+
+/* Advancing tab — presentational stub reserving the slot; Part II fills it in */
+.dv-empty { text-align: center; padding: 26px 20px 22px; border: 1.5px dashed var(--atl-line-strong); border-radius: var(--atl-r-lg); background: var(--atl-input-bg); margin-bottom: 18px; }
+.dv-empty .ico { font-size: 24px; color: var(--atl-amber); opacity: .85; margin-bottom: 8px; }
+.dv-empty h3 { font-family: 'Cormorant Garamond', Georgia, serif; font-size: 19px; font-weight: 600; margin: 0 0 6px; color: var(--atl-ink) !important; }
+.dv-empty p { font-size: 12.5px; color: var(--atl-muted); max-width: 420px; margin: 0 auto 14px; line-height: 1.55; }
+.dv-ghost-sketch { opacity: .5; pointer-events: none; }
+.dv-ghost-label { font-size: 10px; letter-spacing: .16em; text-transform: uppercase; color: var(--atl-muted-dim); text-align: center; margin: 4px 0 12px; }
+.dv-ghost-card { background: var(--atl-input-bg); border: 1px dashed var(--atl-line); border-radius: var(--atl-r-md); padding: 12px; margin-bottom: 8px; }
+.dv-ghost-card .gt { font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--atl-muted); font-weight: 600; margin-bottom: 6px; }
+.dv-ghost-line { height: 8px; border-radius: 4px; background: var(--atl-surface2); margin-bottom: 6px; }
+.dv-ghost-line.s { width: 55%; } .dv-ghost-line.m { width: 80%; }
+.dv-ghost-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+@media (max-width: 560px) { .dv-ghost-grid { grid-template-columns: 1fr; } }
+
+/* Files tab */
+.dv-filegrid { display: grid; grid-template-columns: repeat(auto-fill,minmax(170px,1fr)); gap: 10px; }
+.dv-file { display: flex; align-items: center; gap: 10px; background: var(--atl-surface2); border: 1px solid var(--atl-line); border-radius: var(--atl-r-sm); padding: 11px; text-decoration: none; transition: all .2s ease; }
+.dv-file:hover { border-color: var(--atl-amber-border); background: var(--atl-input-bg); }
+.dv-file .ico { width: 32px; height: 32px; border-radius: 7px; display: grid; place-items: center; font-size: 12px; flex-shrink: 0; background: var(--atl-amber-dim); color: var(--atl-amber); font-family: 'JetBrains Mono', monospace; font-weight: 600; }
+.dv-file .fn { font-size: 11.5px; color: var(--atl-ink-dim); font-weight: 500; word-break: break-word; line-height: 1.3; }
+.dv-file .fm { font-size: 10.5px; color: var(--atl-muted-dim); margin-top: 2px; }
+
+@media (max-width: 640px) {
+    .dv-subhead { padding: 14px 16px 0; }
+}
+
+/* ── Rate card 2026 · price types, groups, rate-card validity (added with the services pricing model) ── */
+/* Rate-card validity banner (top of the Services tab) */
+.svc-ratecard { display:flex; flex-wrap:wrap; align-items:center; gap:10px 18px; background:color-mix(in srgb, var(--atl-amber) 7%, transparent); border:1px solid var(--atl-amber-border); border-radius:10px; padding:12px 16px; margin-bottom:16px; }
+.svc-ratecard--soon { background:color-mix(in srgb, var(--atl-amber) 14%, transparent); border-color:var(--atl-amber); }
+.svc-ratecard--expired { background:color-mix(in srgb, var(--atl-clay) 10%, transparent); border-color:color-mix(in srgb, var(--atl-clay) 40%, transparent); }
+.svc-ratecard__main { display:flex; align-items:center; gap:12px; flex:1 1 260px; font-size:13px; color:var(--atl-ink); }
+.svc-ratecard__main > i { color:var(--atl-amber); font-size:18px; }
+.svc-ratecard--expired .svc-ratecard__main > i { color:var(--atl-clay); }
+.svc-ratecard__status { font-size:12px; color:var(--atl-muted); margin-top:2px; }
+.svc-ratecard--soon .svc-ratecard__status { color:var(--atl-amber); }
+.svc-ratecard--expired .svc-ratecard__status { color:var(--atl-clay); font-weight:600; }
+.svc-ratecard__edit { display:flex; align-items:center; flex-wrap:wrap; gap:8px; font-size:12px; color:var(--atl-muted); }
+.svc-ratecard__edit .um-input { width:auto; min-width:150px; }
+.svc-ratecard__note { flex-basis:100%; margin:0; font-size:11px; line-height:1.5; color:var(--atl-muted); }
+/* Service cards: price label, price-type note, group + Most Booked */
+.svc-cat--group { background:color-mix(in srgb, var(--atl-amber) 15%, transparent); color:var(--atl-amber); }
+.svc-card__price--long { font-size:15px; line-height:1.3; flex-wrap:wrap; }
+.svc-card__quote-note { display:flex; align-items:center; gap:6px; font-size:11px; color:var(--atl-muted); margin:4px 0 0; }
+.svc-card__quote-note i { color:var(--atl-amber); }
+.svc-tag--featured { background:color-mix(in srgb, var(--atl-amber) 18%, transparent); color:var(--atl-amber); }
+/* Drawer: price-type hint + fields that do not apply to the chosen type */
+.svc-drawer__hint { font-size:11px; line-height:1.45; color:var(--atl-muted); margin:-2px 0 12px; }
+.svc-field--off { opacity:.5; }
+
+/* Confirm / prompt dialogs (js/notificationService.js): the title is an <h2>, so the global redesign.css h1-h6{color:var(--text-primary)!important}
+   (always white) made "Confirm Action" invisible on the ivory card - same root cause as .atl-drawer__header h5 above. */
+.tm-modal__title { color: var(--noti-text) !important; }
