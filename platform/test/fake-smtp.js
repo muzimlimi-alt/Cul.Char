@@ -191,7 +191,7 @@ async function startFakeTokenServer(opts = {}) {
             if (form.client_secret !== opts.secret)
                 return send(401, { error: 'invalid_client', error_description: "AADSTS7000215: Invalid client secret provided. Ensure the secret being sent in the request is the client secret value, not the client secret ID, for a secret added to app '" + opts.clientId + "'." + trace, error_codes: [7000215] });
             n++;
-            const token = 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.' + Buffer.from(JSON.stringify({ aud: 'https://outlook.office365.com', n })).toString('base64url') + '.fakeSignature' + n;
+            const token = Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT' })).toString('base64url') + '.' + Buffer.from(JSON.stringify({ aud: 'https://outlook.office365.com', n })).toString('base64url') + '.fakeSignature' + n;
             issued.add(token);
             send(200, { token_type: 'Bearer', expires_in: opts.expiresIn || 3599, ext_expires_in: 3599, access_token: token });
         });

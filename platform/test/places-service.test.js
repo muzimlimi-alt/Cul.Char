@@ -46,18 +46,18 @@ module.exports = async function ({ check }) {
         const g = fakeGoogle({ newAuto: [200, NEW_SUGGESTIONS], newDetails: [200, NEW_PLACE] });
         const log = mkLogger();
         const svc = createPlacesService({ fetch: g.fetch, env: { GOOGLE_MAPS_API_KEY: KEY }, logger: log });
-        const preds = await svc.autocomplete('  Sandton   Convention ', { sessionToken: 'sess_ABCDEFGH12' });
+        const preds = await svc.autocomplete('  Sandton   Convention ', { sessionToken: 'test-session-token' });
         check('New API: autocomplete maps placePrediction to {place_id, main_text, secondary_text, formatted_address}', preds.length === 1 && preds[0].place_id === 'ChIJnewplace0001' && preds[0].main_text === 'Sandton Convention Centre' && preds[0].secondary_text === 'Maude Street, Sandton, South Africa' && /Sandton Convention Centre, Maude/.test(preds[0].formatted_address), JSON.stringify(preds));
         const req = g.calls[0];
         const body = JSON.parse(req.init.body);
         check('New API: key goes in the X-Goog-Api-Key header, never the URL', req.init.headers['X-Goog-Api-Key'] === KEY && !req.url.includes(KEY), req.url);
         check('New API: a field mask is sent and the input is whitespace-normalised', !!req.init.headers['X-Goog-FieldMask'] && body.input === 'Sandton Convention', JSON.stringify(body));
-        check('New API: the session token is forwarded', body.sessionToken === 'sess_ABCDEFGH12', JSON.stringify(body));
-        const d = await svc.details('ChIJnewplace0001', { sessionToken: 'sess_ABCDEFGH12' });
+        check('New API: the session token is forwarded', body.sessionToken === 'test-session-token', JSON.stringify(body));
+        const d = await svc.details('ChIJnewplace0001', { sessionToken: 'test-session-token' });
         const L = d.location;
         check('New API: details normalise to the standard location shape', L.placeId === 'ChIJnewplace0001' && L.name === 'Sandton Convention Centre' && L.city === 'Sandton' && L.state === 'Gauteng' && L.country === 'South Africa' && L.countryCode === 'ZA' && L.postalCode === '2196' && L.latitude === -26.1066 && L.longitude === 28.0567 && L.mapUrl === 'https://maps.google.com/?cid=1', JSON.stringify(L));
         check('New API: details also return the legacy "result" shape the public drawer reads', d.result.address_components[0].long_name === 'Sandton' && d.result.geometry.location.lat === -26.1066 && d.result.formatted_address === L.formattedAddress, JSON.stringify(d.result));
-        check('New API: session token reaches Place Details too', /sessionToken=sess_ABCDEFGH12/.test(g.calls[1].url), g.calls[1].url);
+        check('New API: session token reaches Place Details too', /sessionToken=test-session-token/.test(g.calls[1].url), g.calls[1].url);
         check('nothing was logged on success', log.lines.length === 0, log.lines.join('|'));
     }
 
